@@ -1,0 +1,15 @@
+[package]
+name = "__CRATE_NAME__"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2" }
+
+[dependencies]
+notify-rust = "4"
+tauri = { version = "2" }
+
+[[bin]]
+name = "__CRATE_NAME__"
+path = "src/main.rs"

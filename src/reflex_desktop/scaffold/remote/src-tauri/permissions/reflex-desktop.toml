@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "reflex-desktop-notify"
+description = "Allows Reflex event handlers to show notifications through the generated bridge."
+commands.allow = ["reflex_desktop_notify"]
