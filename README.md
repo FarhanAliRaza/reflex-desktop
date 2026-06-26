@@ -31,6 +31,27 @@ launched native binary inherits the snap's GTK/GIO/locale paths and would crash 
 `undefined symbol: __libc_pthread_init`. `reflex-desktop run` restores the snap's recorded
 originals (`*_VSCODE_SNAP_ORIG`) before launch, so this is handled automatically.
 
+## Limitations
+
+`reflex-desktop` packages a **production build** — it is not a live development environment:
+
+- **No hot reload / HMR.** The desktop window loads a *prebuilt static* frontend, and the
+  embedded backend starts write-free (`REFLEX_SKIP_COMPILE`), so editing your app does **not**
+  live-update the running window. `reflex-desktop dev` is intentionally not implemented yet
+  (v1 is build-only).
+- **Every `run`/`build` is a full build.** There is no incremental dev loop: each invocation
+  re-exports the frontend and compiles the Tauri binary (a debug build is faster than release,
+  but it is still a `cargo` compile).
+
+**Recommended workflow:** develop your app with plain `reflex run` — the normal Reflex web dev
+server, with full hot-reload and fast iteration in the browser — and only switch to
+`reflex-desktop build`/`run` to package and smoke-test the desktop app once you are ready to
+ship. The app code is identical; the desktop step just wraps the finished build. (A live
+desktop dev mode may come later; for now, iterate on the web and build at the end.)
+
+See also **Status** above: shipping a *relocated* `embedded` bundle (an installed `.app`/
+AppImage, not the in-place dev binary) still has remaining work (M2).
+
 ## Prerequisites
 
 There are two audiences with very different requirements:
