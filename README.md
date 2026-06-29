@@ -1,153 +1,206 @@
 # reflex-desktop
 
-Package a [Reflex](https://reflex.dev) app as a native desktop app with
-[Tauri](https://tauri.app) (system WebView).
+Ship your [Reflex](https://reflex.dev) app as a real desktop app — a native window,
+an icon in the dock, an installer you can hand to someone — with
+[Tauri](https://tauri.app) doing the heavy lifting.
 
-A Reflex app is a static React-Router SPA plus a Python ASGI backend. `reflex-desktop`
-builds the frontend with Reflex's native toolchain (no bun/npm inside Tauri), wraps the
-prebuilt static frontend in a Tauri shell, and connects it to the backend in one of two
-modes:
-
-- **`remote`** — frontend-only desktop app talking to a hosted backend over a URL.
-- **`embedded`** — the Python ASGI backend runs in-process inside the Tauri binary via
-  PyO3, against a bundled relocatable interpreter (python-build-standalone) and the app's
-  site-packages — self-contained, no Python required on the target.
-
-## Status
-
-- **remote** — complete and verified end-to-end (env.json rebasing, scaffold, static
-  copy, `cargo build` of the embedded-frontend binary).
-- **embedded** — verified end-to-end for an in-place (dev) build: the binary links
-  `libpython` (PyO3), boots a bundled python-build-standalone interpreter in-process, and
-  serves the Reflex ASGI backend on `127.0.0.1:<port>` — `/_health` returns and the
-  socket.io `/_event` WebSocket accepts the Tauri origin. Startup is write-free/backend-only
-  (`REFLEX_SKIP_COMPILE` set via the environment API; no `bun install`/compile). Remaining
-  for a shippable *bundle* (M2): make the bundled resources resolve via Tauri's
-  `resource_dir()` (not the dev `REFLEX_DESKTOP_RESOURCE_DIR`), a `$ORIGIN`-relative libpython
-  rpath for the relocated interpreter, macOS signing, and bundle-size trimming.
-
-When the build runs inside a snap-confined terminal (e.g. VS Code installed as a snap), the
-launched native binary inherits the snap's GTK/GIO/locale paths and would crash with
-`undefined symbol: __libc_pthread_init`. `reflex-desktop run` restores the snap's recorded
-originals (`*_VSCODE_SNAP_ORIG`) before launch, so this is handled automatically.
-
-## Limitations
-
-`reflex-desktop` packages a **production build** — it is not a live development environment:
-
-- **No hot reload / HMR.** The desktop window loads a *prebuilt static* frontend, and the
-  embedded backend starts write-free (`REFLEX_SKIP_COMPILE`), so editing your app does **not**
-  live-update the running window. `reflex-desktop dev` is intentionally not implemented yet
-  (v1 is build-only).
-- **Every `run`/`build` is a full build.** There is no incremental dev loop: each invocation
-  re-exports the frontend and compiles the Tauri binary (a debug build is faster than release,
-  but it is still a `cargo` compile).
-
-**Recommended workflow:** develop your app with plain `reflex run` — the normal Reflex web dev
-server, with full hot-reload and fast iteration in the browser — and only switch to
-`reflex-desktop build`/`run` to package and smoke-test the desktop app once you are ready to
-ship. The app code is identical; the desktop step just wraps the finished build. (A live
-desktop dev mode may come later; for now, iterate on the web and build at the end.)
-
-See also **Status** above: shipping a *relocated* `embedded` bundle (an installed `.app`/
-AppImage, not the in-place dev binary) still has remaining work (M2).
-
-## Prerequisites
-
-There are two audiences with very different requirements:
-
-- **End users who install the shipped app** need **nothing** — the `.dmg`/`.msi`/
-  `.AppImage`/`.deb` is self-contained (in `embedded` mode it even bundles the Python
-  interpreter). The only caveat is Windows' WebView2 runtime, which ships with Windows 11
-  and recent Windows 10 (and the Tauri bundler can include the bootstrapper).
-- **Developers who *build* the app** (run `reflex-desktop build`/`run`) need a native
-  toolchain on their machine, because the build compiles a Tauri (Rust) shell from source —
-  a `pip install` cannot ship a C/Rust compiler. This is the standard Tauri developer setup:
-
-  | | Requirement |
-  |---|---|
-  | **All platforms** | Rust toolchain (`cargo`), via [rustup](https://rustup.rs) |
-  | **Linux** | `libwebkit2gtk-4.1-dev`, `build-essential`, `libssl-dev`, `librsvg2-dev`, `libayatana-appindicator3-dev`, `curl`/`wget`/`file` |
-  | **macOS** | Xcode Command Line Tools (`xcode-select --install`) |
-  | **Windows** | Microsoft C++ Build Tools (MSVC) + the WebView2 runtime |
-  | **`--bundle`** | the Tauri CLI: `cargo install tauri-cli --locked` |
-  | **`embedded`** | network access on the first build (downloads a python-build-standalone interpreter and pip-installs the backend) |
-
-  Exact package names vary by distro/version — see Tauri's
-  [prerequisites](https://tauri.app/start/prerequisites/) for the source of truth.
-
-Check your machine before building:
+You write a normal Reflex app. `reflex-desktop` wraps it in a lightweight native shell
+(the OS's built-in WebView, not a bundled Chromium) and either points it at a backend you
+host, or tucks the whole Python backend *inside* the binary so the finished app needs
+nothing installed on the machine it runs on.
 
 ```bash
-reflex-desktop doctor            # verify Rust + platform WebView deps
-reflex-desktop doctor --bundle   # also verify the Tauri CLI (for installers)
+reflex-desktop run     # build the desktop app and open it
 ```
 
-`build`/`run` run these same checks first and abort with copy-pasteable install steps if a
-required dependency is missing, rather than failing later with a cryptic linker error.
+---
 
-## Usage
+## How it works
+
+A Reflex app is two halves: a static frontend (a React-Router single-page app) and a
+Python backend. `reflex-desktop` builds the frontend with Reflex's own toolchain, drops it
+into a Tauri shell, and connects it to the backend one of two ways:
+
+- **`embedded`** *(default)* — the Python backend runs *in-process* inside the Tauri binary
+  via [PyO3](https://pyo3.rs), against a bundled standalone interpreter. The result is
+  self-contained: no Python, no separate server, nothing to install. Just launch the app.
+- **`remote`** — a frontend-only desktop app that talks to a backend you run somewhere else
+  over a URL. Good when the backend already lives on a server.
+
+Most people want `embedded`. Reach for `remote` when the backend is hosted separately.
+
+---
+
+## Your first app
+
+Never built a Reflex app? Start with the framework, not with us — go through the
+[Reflex quickstart](https://reflex.dev/docs/getting-started/introduction/) first. Everything
+there is exactly the same here; `reflex-desktop` only changes the *last* step, where the app
+gets packaged.
+
+If you just want to see it work, here's a hello-world from scratch.
+
+**1. Create a Reflex app** (see the [installation guide](https://reflex.dev/docs/getting-started/installation/)):
 
 ```bash
-uv pip install -e ignore/reflex-tauri --no-deps
+mkdir hello && cd hello
+uv venv && source .venv/bin/activate
+uv pip install reflex
+reflex init                 # pick a blank template
 ```
 
-In `rxconfig.py`:
+**2. Add `reflex-desktop`.** It isn't on PyPI yet, so install it from this repo:
+
+```bash
+uv pip install -e /path/to/reflex-desktop
+```
+
+**3. Write the app.** Replace `hello/hello.py` with a tiny counter — the count lives in
+Python state, so every click round-trips to the backend and back:
 
 ```python
 import reflex as rx
+
+
+class State(rx.State):
+    count: int = 0
+
+    @rx.event
+    def increment(self):
+        self.count += 1
+
+
+def index():
+    return rx.center(
+        rx.vstack(
+            rx.heading(f"Count: {State.count}"),
+            rx.button("Click me", on_click=State.increment),
+            align="center",
+        ),
+        height="100vh",
+    )
+
+
+app = rx.App()
+app.add_page(index)
+```
+
+**4. Turn on the desktop plugin** in `rxconfig.py`:
+
+```python
+import reflex as rx
+
 from reflex_desktop import DesktopPlugin
 
 config = rx.Config(
-    app_name="my_app",
-    cors_allowed_origins=["*"],  # allow the Tauri webview origin
+    app_name="hello",
+    cors_allowed_origins=["*"],          # let the Tauri webview reach the backend
     plugins=[
-        DesktopPlugin(backend="remote", backend_url="https://api.my_app.com"),
+        DesktopPlugin(backend="embedded"),
     ],
 )
 ```
 
-Then:
+**5. Build and launch:**
 
 ```bash
-reflex-desktop run              # build the desktop app and launch it
-reflex-desktop build            # build only (reflex export --frontend-only + cargo build --release)
-reflex-desktop build --bundle   # also produce installers via the Tauri CLI
-reflex-desktop run --skip-build # relaunch an already-built app
+reflex-desktop run
 ```
 
-For `backend="embedded"`, `reflex-desktop build` additionally downloads a relocatable
-interpreter, pip-installs the backend into `site-packages/`, copies the app payload, and
-sets `PYO3_PYTHON` for the `cargo` build.
+That's it — a native window with your app inside. The first build pulls down a standalone
+Python interpreter and compiles the Rust shell, so it takes a few minutes; everything after
+that is quick.
 
-The Tauri project is scaffolded under `<app>/<tauri_dir>/` (default `tauri/`), with
-`src-tauri/` and the copied static frontend in `dist/`.
+> **A note on iterating:** for day-to-day development, use plain `reflex run` — the normal
+> Reflex dev server with hot reload, in your browser. The app code is identical. Only switch
+> to `reflex-desktop` when you're ready to package and smoke-test the desktop build. See
+> [Limitations](#limitations) for why.
+
+There's a fuller, multi-page example (background events, forms, native window controls) in
+[`example/`](example/) if you want something less trivial to poke at.
+
+---
+
+## Commands
+
+```bash
+reflex-desktop run                # build the app, then launch it
+reflex-desktop run --skip-build   # relaunch an already-built app, no recompile
+reflex-desktop build              # build only (release)
+reflex-desktop build --bundle     # also produce installers (.dmg/.msi/.AppImage/.deb)
+reflex-desktop doctor             # check your machine has what it needs to build
+```
+
+`run` does a fast **debug** build by default (like `cargo run`); add `--release` for an
+optimized one. `build` defaults to **release**. The generated Tauri project lives under
+`<app>/tauri/`, and it's a perfectly normal Tauri project — edit `src-tauri/` directly if
+you ever need to.
+
+---
+
+## Prerequisites
+
+Two very different audiences here:
+
+**People who *use* the shipped app** need nothing. The installer is self-contained — in
+`embedded` mode it even carries its own Python. (The one asterisk: Windows needs the
+WebView2 runtime, which already ships with Windows 11 and recent Windows 10, and the bundler
+can include the installer for it.)
+
+**People who *build* the app** need a native toolchain, because the build compiles a Rust
+shell from source — a `pip install` can't ship you a compiler. This is the standard
+[Tauri setup](https://tauri.app/start/prerequisites/):
+
+| | What you need |
+|---|---|
+| **All platforms** | Rust, via [rustup](https://rustup.rs) |
+| **Linux** | `libwebkit2gtk-4.1-dev`, `build-essential`, `libssl-dev`, `librsvg2-dev`, `libayatana-appindicator3-dev`, plus `curl`/`wget`/`file` |
+| **macOS** | Xcode Command Line Tools (`xcode-select --install`) |
+| **Windows** | Microsoft C++ Build Tools (MSVC) + the WebView2 runtime |
+| **`--bundle`** | the Tauri CLI: `cargo install tauri-cli --locked` |
+| **`embedded`** | a network connection on the *first* build (it downloads an interpreter and installs the backend) |
+
+Package names drift between distros — Tauri's
+[prerequisites page](https://tauri.app/start/prerequisites/) is the source of truth.
+
+Not sure you're set up? Run:
+
+```bash
+reflex-desktop doctor            # Rust + platform WebView deps
+reflex-desktop doctor --bundle   # also checks the Tauri CLI, for installers
+```
+
+`build` and `run` run these checks first anyway, and stop with copy-pasteable install
+commands if something's missing — no cryptic linker errors halfway through a compile.
+
+---
 
 ## Customizing the window, icon & native APIs
 
-`DesktopPlugin` is the source of truth for the generated `tauri.conf.json`, `capabilities/`,
-and (extra) plugin deps — these are re-applied on **every** build (hand edits outside the
-managed regions are preserved). Set them in `rxconfig.py`:
+`DesktopPlugin` is the single source of truth for the generated `tauri.conf.json`,
+capabilities, and plugin dependencies. It re-applies them on every build, and leaves your
+hand edits outside the managed regions alone. Configure it in `rxconfig.py`:
 
 ```python
 DesktopPlugin(
     backend="embedded",
     window_width=1100, window_height=750,
-    resizable=True, min_width=900, min_height=650, center=True,  # + fullscreen/decorations/
-    theme="Dark",                                                #   transparent/always_on_top/maximized
-    icon="assets/logo.png",          # copied over the bundle icons (PNG)
+    resizable=True, min_width=900, min_height=650, center=True,
+    theme="Dark",                    # + fullscreen / decorations / transparent / always_on_top
+    icon="assets/logo.png",          # a PNG, copied over the bundle icons
     with_global_tauri=True,          # default — exposes window.__TAURI__ for the bridge below
-    tauri_plugins=("notification",), # crate tauri-plugin-<name>, injected + permissioned
+    tauri_plugins=("notification",), # pulls in tauri-plugin-<name>, wired up + permissioned
     extra_capabilities=("os:default",),
 )
 ```
 
-**Icons:** `icon=` copies one PNG over the four bundle icons. For the full platform set
-(`.ico`/`.icns` + every size) run `cd <tauri_dir>/src-tauri && cargo tauri icon <path>`.
+**Icons.** `icon=` copies one PNG over the four default bundle icons. For the full platform
+set (`.ico`/`.icns` and every size), run
+`cd <app>/tauri/src-tauri && cargo tauri icon <path>`.
 
-**Native APIs from Reflex events** — `reflex_desktop.desktop` wraps `window.__TAURI__` so a
-Python handler can drive the window/OS (`with_global_tauri=True` required, which it is by
-default):
+**Driving the OS from Python.** `reflex_desktop.desktop` wraps `window.__TAURI__` so a Reflex
+event handler can control the window or fire native APIs (needs `with_global_tauri=True`,
+which is the default):
 
 ```python
 from reflex_desktop import desktop
@@ -158,11 +211,42 @@ rx.button("close", on_click=desktop.close())
 rx.button("notify", on_click=desktop.notify("Title", "Body"))  # needs tauri_plugins=("notification",)
 ```
 
-`desktop.notify()` requests OS notification permission before sending (a silent no-op
-otherwise on macOS/Windows). On Linux a *bundled* app (`reflex-desktop build --bundle`, which
-installs a `.desktop` entry) shows banners reliably; a bare dev binary may have notifications
-collected in the desktop's notification tray instead of popped as a banner.
+`desktop.notify()` asks for OS notification permission before sending (otherwise it's a
+silent no-op on macOS/Windows). On Linux, a *bundled* app (`--bundle`, which installs a
+`.desktop` entry) shows banners reliably; a bare dev binary may route them to the
+notification tray instead.
 
-Anything the plugin doesn't expose can still be done by editing the generated `src-tauri/`
-project directly — it's a normal Tauri project (add plugins needing a non-`init()` builder to
-`main.rs` by hand, etc.).
+Anything the plugin doesn't cover, you can still do by hand — `src-tauri/` is a standard
+Tauri project, so add crates, edit `main.rs`, whatever you need.
+
+---
+
+## Limitations
+
+`reflex-desktop` packages a **production build**. It is not a live dev environment, and on
+purpose:
+
+- **No hot reload.** The window loads a *prebuilt static* frontend, and the embedded backend
+  starts without recompiling, so editing your app doesn't live-update the running window.
+- **Every build is a full build.** There's no incremental loop yet — each `run`/`build`
+  re-exports the frontend and compiles the Tauri binary (debug is faster than release, but
+  it's still a `cargo` compile).
+- **`reflex-desktop dev` isn't implemented.** v1 is build-only; a live desktop dev mode may
+  come later.
+
+So: **develop with `reflex run`** (browser, hot reload, fast), and use `reflex-desktop` to
+package and test the desktop build when you're ready to ship.
+
+### What's solid vs. still in progress
+
+- **`remote`** — done and verified end-to-end.
+- **`embedded`** — works end-to-end as an in-place (dev) build: the binary boots a bundled
+  interpreter in-process and serves your Reflex backend locally. Producing a fully
+  *relocatable* installer (an installed `.app`/AppImage you can move to another machine)
+  still has a few loose ends — a relocation-safe library path for the bundled interpreter,
+  macOS signing, and trimming the bundle size.
+
+> **Heads up for snap users:** if you build from a snap-confined terminal (e.g. VS Code
+> installed via snap), the launched binary would otherwise inherit the snap's GTK/locale
+> paths and crash. `reflex-desktop run` detects this and restores the originals before
+> launch, so it just works.
