@@ -18,11 +18,64 @@ falls back to Tauri's notification plugin.
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import reflex as rx
+from reflex.event import EventType
 
 #: The current Tauri window object in the webview (Tauri 2 global API).
 _WINDOW = "window.__TAURI__.window.getCurrentWindow()"
+
+
+def invoke(
+    command: str,
+    args: dict[str, Any] | None = None,
+    *,
+    callback: EventType[Any] | None = None,
+) -> rx.event.EventSpec:
+    """Call a Tauri command from a Reflex event handler.
+
+    This is the bridge to native code. It wraps ``window.__TAURI__.core.invoke`` so you
+    can reach either:
+
+    * a custom ``#[tauri::command]`` you added to ``src-tauri`` (see the README), or
+    * a Tauri plugin command, addressed as ``"plugin:<name>|<command>"`` — e.g.
+      ``"plugin:fs|read_text_file"`` once ``DesktopPlugin(tauri_plugins=("fs",))`` is set.
+
+    Use it directly as a handler, or pass ``callback`` to feed the command's return value
+    back into a Reflex event (the returned promise is resolved before the callback runs)::
+
+        from reflex_desktop import desktop
+
+        # fire-and-forget
+        rx.button("ping native", on_click=desktop.invoke("my_command"))
+
+        # with arguments + the result routed back into State
+        rx.button(
+            "read file",
+            on_click=desktop.invoke(
+                "plugin:fs|read_text_file",
+                {"path": "/etc/hostname"},
+                callback=State.on_file_read,
+            ),
+        )
+
+    Requires ``DesktopPlugin(with_global_tauri=True)`` (the default). Argument keys follow
+    the command's own convention (Tauri maps them to its parameters).
+
+    Args:
+        command: The Tauri command name (or ``"plugin:<name>|<command>"``).
+        args: Arguments passed to the command. Omit for a no-argument command.
+        callback: A Reflex event handler to receive the command's return value.
+
+    Returns:
+        A Reflex event that invokes the command in the webview.
+    """
+    args_literal = json.dumps(args or {})
+    script = f"window.__TAURI__.core.invoke({json.dumps(command)}, {args_literal})"
+    if callback is not None:
+        return rx.call_script(script, callback=callback)
+    return rx.call_script(script)
 
 
 def minimize() -> rx.event.EventSpec:

@@ -216,8 +216,47 @@ silent no-op on macOS/Windows). On Linux, a *bundled* app (`--bundle`, which ins
 `.desktop` entry) shows banners reliably; a bare dev binary may route them to the
 notification tray instead.
 
-Anything the plugin doesn't cover, you can still do by hand — `src-tauri/` is a standard
-Tauri project, so add crates, edit `main.rs`, whatever you need.
+**Calling native code: `desktop.invoke()`.** The window helpers above are convenience
+wrappers; `desktop.invoke()` is the general escape hatch to any Tauri command, so you don't
+have to hand-write `rx.call_script("window.__TAURI__.core.invoke(...)")`. Pass arguments as a
+dict and, if you want the result back, a `callback` — the returned promise is resolved before
+your handler runs:
+
+```python
+from reflex_desktop import desktop
+
+# a Tauri plugin command — enable the plugin first: tauri_plugins=("fs",)
+rx.button(
+    "read file",
+    on_click=desktop.invoke(
+        "plugin:fs|read_text_file",
+        {"path": "/etc/hostname"},
+        callback=State.on_file_read,   # State.on_file_read(self, contents)
+    ),
+)
+
+# your own #[tauri::command]
+rx.button("do native thing", on_click=desktop.invoke("my_command", {"x": 1}))
+```
+
+> **Note on the `embedded` backend:** because the Python backend runs *in-process on the
+> user's machine*, you usually don't need the bridge at all for system access — just use
+> plain Python in an event handler (`open()`, `pathlib`, `subprocess`, …), running with the
+> user's own privileges. Reach for `desktop.invoke()` when you specifically want the
+> *webview/Tauri* side (native dialogs, OS integration, a Rust command). In `remote` mode,
+> where Python runs on a server, the bridge is the only way to touch the local machine.
+> For slow filesystem/subprocess work in an event handler, use a Reflex background event
+> (`@rx.event(background=True)`) so you don't block the backend's event loop.
+
+**Adding your own Rust command.** `src-tauri/` is a standard Tauri project — add the
+`#[tauri::command]` in `main.rs` and register it. One catch: the plugin manages the
+`.invoke_handler(generate_handler![...])` line (that's how the notification bridge is wired),
+and it's rewritten on every build, so a command hand-added there doesn't survive a rebuild
+yet. Until that's first-class, prefer official Tauri plugins via `tauri_plugins=(...)` (which
+*are* rebuild-safe) and call them with `desktop.invoke("plugin:<name>|<command>", ...)`.
+
+Anything else the plugin doesn't cover, you can still do by hand in `src-tauri/` — add
+crates, edit `main.rs`, whatever you need.
 
 ---
 
