@@ -252,17 +252,32 @@ rx.button("do native thing", on_click=desktop.invoke("my_command", {"x": 1}))
 ### Adding your own Rust command (and calling it type-safely)
 
 `src-tauri/` is a standard Tauri project, so you add native code the normal Tauri way — just
-write the command. **You don't register it by hand:** on every build, reflex-desktop scans
-`src-tauri/src` for `#[tauri::command]` functions and wires each one into
-`generate_handler!` (and grants it the capability to be invoked). Add the function, and it's
-live on the next build — rebuild-safe, no list to maintain.
+write the command in `main.rs`. **You don't register it by hand:** on every build,
+reflex-desktop reads the `#[tauri::command]` functions in `main.rs` and rewrites a managed
+region inside `generate_handler!` to register each one (and grants it the capability to be
+invoked). Add the function, and it's live on the next build — rebuild-safe, no list to maintain.
 
 ```rust
-// src-tauri/src/main.rs — add anywhere; the build registers it for you.
+// src-tauri/src/main.rs — add the command; the build registers it for you.
 #[tauri::command(rename_all = "snake_case")]
 fn read_note(file_path: String) -> Result<String, String> {
     std::fs::read_to_string(&file_path).map_err(|e| e.to_string())
 }
+```
+
+Only `main.rs` is scanned, because `generate_handler!` references commands unqualified and
+they must be in scope there. If you'd rather keep commands in their own module, that's fine —
+register them yourself by adding the qualified path inside the macro, *outside* the managed
+markers (the build leaves your additions alone):
+
+```rust
+.invoke_handler(tauri::generate_handler![
+    // >>> reflex-desktop commands >>>
+    reflex_desktop_notify,
+    read_note,
+    // <<< reflex-desktop commands <<<
+    commands::open_db,   // your own — preserved across rebuilds
+])
 ```
 
 Then generate a **typed Python binding** from that Rust signature so the call site is

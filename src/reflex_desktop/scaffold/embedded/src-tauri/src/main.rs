@@ -156,7 +156,11 @@ fn main() {
     }
 
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![reflex_desktop_notify])
+        .invoke_handler(tauri::generate_handler![
+            // >>> reflex-desktop commands >>>
+            reflex_desktop_notify,
+            // <<< reflex-desktop commands <<<
+        ])
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_focus();

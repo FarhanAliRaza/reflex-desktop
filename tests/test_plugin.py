@@ -144,7 +144,9 @@ def test_post_build_upgrades_existing_project_with_notification_bridge(tmp_path,
     main_text = main_rs.read_text()
     assert "fn reflex_desktop_run_notification_helper" in main_text
     assert "fn reflex_desktop_notify" in main_text
-    assert "generate_handler![reflex_desktop_notify]" in main_text
+    assert "// >>> reflex-desktop commands >>>" in main_text
+    assert "reflex_desktop_notify," in main_text
+    assert main_text.count(".invoke_handler(") == 1
     assert "reflex_desktop_terminal_log" not in main_text
     assert "reflex-desktop notify:" not in main_text
     assert "notify helper:" not in main_text
@@ -213,7 +215,10 @@ def test_scaffold_includes_reflex_notification_bridge(tmp_path, monkeypatch):
     assert "reflex-desktop-notify" in capability_permissions
     assert "fn reflex_desktop_run_notification_helper" in main_rs
     assert "fn reflex_desktop_notify" in main_rs
-    assert "generate_handler![reflex_desktop_notify]" in main_rs
+    # The bridge command is registered inside the managed command region.
+    assert "// >>> reflex-desktop commands >>>" in main_rs
+    assert "reflex_desktop_notify," in main_rs
+    assert main_rs.count(".invoke_handler(") == 1
     assert "reflex_desktop_terminal_log" not in main_rs
     assert "reflex-desktop notify:" not in main_rs
     assert "notify helper:" not in main_rs

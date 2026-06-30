@@ -64,8 +64,20 @@ _SCALAR_TYPES = {
 }
 
 
+#: Prefix marking reflex-desktop's own bridge commands (excluded from generated bindings).
+_INTERNAL_PREFIX = "reflex_desktop_"
+
 #: Default filename for the generated bindings module.
 DEFAULT_STUB_FILENAME = "desktop_commands.py"
+
+# Compiled once: a Tauri command attribute, the function header that follows it, the tokens
+# that terminate a return type, and the leading qualifiers stripped off an argument type.
+_CMD_ATTR_RE = re.compile(r"#\[\s*tauri::command\b")
+_FN_RE = re.compile(r"\bfn\s+(\w+)\s*\(")
+_RETURN_STOP_RE = re.compile(r"\{|;|\bwhere\b")
+_LEADING_REF_RE = re.compile(r"^&\s*")
+_LEADING_LIFETIME_RE = re.compile(r"^'\w+\s+")
+_LEADING_MUT_RE = re.compile(r"^mut\s+")
 
 
 def default_output_path(app_root: Path, app_name: str | None) -> Path:
@@ -82,6 +94,31 @@ def default_output_path(app_root: Path, app_name: str | None) -> Path:
     pkg = app_root / app_name if app_name else None
     base = pkg if pkg and pkg.is_dir() else app_root
     return base / DEFAULT_STUB_FILENAME
+
+
+def resolve_output_path(app_root: Path, override: str | None = None) -> Path:
+    """Resolve where the generated bindings module should be written.
+
+    Shared by the CLI (``--out``) and the build-time plugin so both pick the same location.
+
+    Args:
+        app_root: The app root (holds ``rxconfig.py``).
+        override: An explicit path relative to ``app_root``; when given it wins outright.
+
+    Returns:
+        The resolved output path.
+    """
+    if override:
+        return (app_root / override).resolve()
+    app_name = None
+    try:
+        from reflex_base.config import get_config
+
+        config = get_config()
+        app_name = getattr(config, "app_name", None) if config else None
+    except Exception:  # noqa: BLE001 - config read is best-effort; fall back to app root
+        app_name = None
+    return default_output_path(app_root, app_name)
 
 
 @dataclass(frozen=True)
@@ -114,9 +151,9 @@ def rust_type_to_python(rust: str) -> str:
     """
     t = rust.strip()
     # Strip references, mutability and leading lifetimes: `&'a mut str` -> `str`.
-    t = re.sub(r"^&\s*", "", t)
-    t = re.sub(r"^'\w+\s+", "", t)
-    t = re.sub(r"^mut\s+", "", t)
+    t = _LEADING_REF_RE.sub("", t)
+    t = _LEADING_LIFETIME_RE.sub("", t)
+    t = _LEADING_MUT_RE.sub("", t)
     t = t.strip()
 
     if t in ("", "()"):
@@ -173,14 +210,24 @@ def _split_top_level(s: str) -> list[str]:
 
 def _is_injected(rust_type: str) -> bool:
     """Whether an argument type is something Tauri injects (not passed from JS)."""
-    t = re.sub(r"^&\s*", "", rust_type.strip())
-    t = re.sub(r"^'\w+\s+", "", t).strip()
+    t = _LEADING_REF_RE.sub("", rust_type.strip())
+    t = _LEADING_LIFETIME_RE.sub("", t).strip()
     base = _split_generic(t)[0].rsplit("::", 1)[-1].strip()
     return base in _INJECTED_TYPES
 
 
-def _scan_balanced(text: str, open_idx: int, open_ch: str, close_ch: str) -> int:
-    """Return the index just past the balanced closer for the bracket at ``open_idx``."""
+def scan_balanced(text: str, open_idx: int, open_ch: str, close_ch: str) -> int:
+    """Return the index just past the balanced closer for the bracket at ``open_idx``.
+
+    Args:
+        text: The text to scan.
+        open_idx: Index of the opening bracket.
+        open_ch: The opening bracket character.
+        close_ch: The matching closing bracket character.
+
+    Returns:
+        The index just past the matching closer, or ``-1`` if unbalanced.
+    """
     depth = 0
     for i in range(open_idx, len(text)):
         if text[i] == open_ch:
@@ -189,6 +236,49 @@ def _scan_balanced(text: str, open_idx: int, open_ch: str, close_ch: str) -> int
             depth -= 1
             if depth == 0:
                 return i + 1
+    return -1
+
+
+def _skip_double_quoted(text: str, i: int) -> int:
+    """Given ``i`` at an opening ``"``, return the index just past the closing quote."""
+    i += 1
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == '"':
+            return i + 1
+        i += 1
+    return len(text)
+
+
+def _scan_attribute_end(text: str, open_idx: int) -> int:
+    """Return the index past the ``]`` closing the attribute whose ``[`` is at ``open_idx``.
+
+    Tracks nested brackets and skips ``"…"`` string literals so a ``]`` inside an attribute
+    argument (e.g. ``#[tauri::command(msg = "oops]")]``) doesn't end the scan early.
+
+    Args:
+        text: The Rust source.
+        open_idx: Index of the attribute's opening ``[``.
+
+    Returns:
+        The index just past the closing ``]``, or ``-1`` if unbalanced.
+    """
+    depth = 0
+    i = open_idx
+    while i < len(text):
+        ch = text[i]
+        if ch == '"':
+            i = _skip_double_quoted(text, i)
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
     return -1
 
 
@@ -220,23 +310,28 @@ def extract_commands(rust_source: str) -> list[Command]:
         The parsed commands, in source order.
     """
     commands: list[Command] = []
-    for attr in re.finditer(r"#\[tauri::command\b[^\]]*\]", rust_source):
-        # From the attribute, find the function signature that follows (skipping any further
-        # attributes / cfg lines and the async/pub/const qualifiers).
-        m = re.compile(r"\bfn\s+(\w+)\s*\(").search(rust_source, attr.end())
+    for attr in _CMD_ATTR_RE.finditer(rust_source):
+        bracket = rust_source.find("[", attr.start())
+        attr_end = _scan_attribute_end(rust_source, bracket)
+        if attr_end == -1:
+            continue
+        # The command attribute binds to the next function (any further #[…]/#[cfg] lines and
+        # the async/pub/const qualifiers sit between the attribute and `fn`).
+        m = _FN_RE.search(rust_source, attr_end)
         if not m:
             continue
         name = m.group(1)
         paren_open = m.end() - 1
-        paren_close = _scan_balanced(rust_source, paren_open, "(", ")")
+        paren_close = scan_balanced(rust_source, paren_open, "(", ")")
         if paren_close == -1:
             continue
         params = rust_source[paren_open + 1 : paren_close - 1]
 
-        # Return type: between `->` and the opening `{` (or `;` for a trait decl).
+        # Return type is between `->` and the body `{` — stopping at a `where` clause or a
+        # `;` (trait/extern decl) so neither leaks into the type.
         rest = rust_source[paren_close:]
-        body = re.search(r"[{;]", rest)
-        head = rest[: body.start()] if body else rest
+        stop = _RETURN_STOP_RE.search(rest)
+        head = rest[: stop.start()] if stop else rest
         ret_match = re.search(r"->\s*(.+)", head, re.DOTALL)
         return_type = rust_type_to_python(ret_match.group(1).strip()) if ret_match else "None"
 
@@ -247,21 +342,41 @@ def extract_commands(rust_source: str) -> list[Command]:
 
 
 def discover_commands(src_tauri: Path) -> list[Command]:
-    """Find every Tauri command under ``src-tauri/src``, de-duplicated by name.
+    """Find the Tauri commands defined in ``src-tauri/src/main.rs``, sorted by name.
+
+    Only ``main.rs`` is scanned: those are the commands the plugin registers in
+    ``generate_handler!`` (where they must be in scope unqualified). Commands a user splits
+    into other modules and registers by hand are intentionally not picked up here, so the
+    generated bindings never expose a command that isn't actually wired up.
 
     Args:
         src_tauri: The ``src-tauri`` directory.
 
     Returns:
-        Parsed commands sorted by name.
+        Parsed commands, de-duplicated and sorted by name.
     """
-    src = src_tauri / "src"
+    main_rs = src_tauri / "src" / "main.rs"
+    if not main_rs.is_file():
+        return []
     by_name: dict[str, Command] = {}
-    if src.is_dir():
-        for rs in sorted(src.rglob("*.rs")):
-            for command in extract_commands(rs.read_text()):
-                by_name.setdefault(command.name, command)
+    for command in extract_commands(main_rs.read_text()):
+        by_name.setdefault(command.name, command)
     return sorted(by_name.values(), key=lambda c: c.name)
+
+
+def public_commands(commands: list[Command], *, include_internal: bool = False) -> list[Command]:
+    """Filter out reflex-desktop's own bridge commands unless explicitly included.
+
+    Args:
+        commands: All parsed commands.
+        include_internal: Keep ``reflex_desktop_*`` bridge commands when ``True``.
+
+    Returns:
+        The commands to expose as typed bindings.
+    """
+    if include_internal:
+        return list(commands)
+    return [c for c in commands if not c.name.startswith(_INTERNAL_PREFIX)]
 
 
 _GENERATED_HEADER = '''"""Typed Tauri command bindings — generated by reflex-desktop.
@@ -317,8 +432,8 @@ def render_module(commands: list[Command], *, include_internal: bool = False) ->
     Returns:
         Python source for the generated bindings module.
     """
-    public = [c for c in commands if include_internal or not c.name.startswith("reflex_desktop_")]
+    public = public_commands(commands, include_internal=include_internal)
     all_names = ", ".join(f'"{c.name}"' for c in public)
     header = _GENERATED_HEADER.format(all_names=all_names)
-    bodies = "\n\n".join(_render_command(c, c.name.startswith("reflex_desktop_")) for c in public)
+    bodies = "\n\n".join(_render_command(c, c.name.startswith(_INTERNAL_PREFIX)) for c in public)
     return f"{header}\n\n{bodies}\n" if bodies else f"{header}\n"

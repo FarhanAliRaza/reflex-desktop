@@ -108,6 +108,46 @@ def test_render_module_is_valid_python_and_exposes_public_commands():
     compile(module, "<generated>", "exec")
 
 
+def test_extract_handles_closing_bracket_inside_attribute_string():
+    """A `]` inside the command attribute must not end attribute parsing early."""
+    src = """
+#[tauri::command(rename_all = "snake_case")]
+fn ok(value: String) -> String { value }
+
+#[tauri::command(some_attr = "has ] bracket")]
+fn weird(x: i32) -> i32 { x }
+"""
+    cmds = {c.name: c for c in extract_commands(src)}
+    assert set(cmds) == {"ok", "weird"}
+    assert cmds["weird"].arguments == (Argument("x", "int"),)
+
+
+def test_extract_strips_where_clause_from_return_type():
+    """A `where` clause must not leak into the parsed return type."""
+    src = """
+#[tauri::command]
+fn fetch(url: String) -> String
+where
+    Self: Sized,
+{
+    url
+}
+"""
+    (cmd,) = extract_commands(src)
+    assert cmd.return_type == "str"
+
+
+def test_discover_commands_reads_only_main_rs(tmp_path):
+    """Discovery is scoped to main.rs — commands in sibling modules are ignored."""
+    src = tmp_path / "src-tauri" / "src"
+    src.mkdir(parents=True)
+    (src / "main.rs").write_text("#[tauri::command]\nfn in_main() {}\n")
+    (src / "other.rs").write_text("#[tauri::command]\nfn in_other() {}\n")
+
+    names = {c.name for c in codegen.discover_commands(tmp_path / "src-tauri")}
+    assert names == {"in_main"}
+
+
 def test_render_module_can_include_internal():
     from reflex_desktop.codegen import Command
 

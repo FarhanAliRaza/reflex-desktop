@@ -440,22 +440,10 @@ def codegen_cmd(app_dir: str, out: str | None, include_internal: bool) -> None:
 
     commands = codegen.discover_commands(src_tauri)
     module = codegen.render_module(commands, include_internal=include_internal)
-    if out:
-        out_path = (app_root / out).resolve()
-    else:
-        try:
-            from reflex_base.config import get_config
-
-            app_name = getattr(get_config(), "app_name", None)
-        except Exception:  # noqa: BLE001 - best-effort config read
-            app_name = None
-        out_path = codegen.default_output_path(app_root, app_name)
-
+    out_path = codegen.resolve_output_path(app_root, out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(module)
-    shown = [
-        c for c in commands if include_internal or not c.name.startswith("reflex_desktop_")
-    ]
+    shown = codegen.public_commands(commands, include_internal=include_internal)
     click.echo(f"reflex-desktop: wrote {len(shown)} command binding(s) to {out_path}")
 
 
