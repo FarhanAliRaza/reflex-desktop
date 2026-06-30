@@ -11,6 +11,7 @@ from typing import Literal
 
 from reflex.plugins import Plugin
 
+from . import codegen
 from .config import DEFAULT_PORT, DEFAULT_TAURI_DIR, LOOPBACK_HOST, slugify
 
 BackendMode = Literal["remote", "embedded"]
@@ -25,15 +26,33 @@ _BACKEND_MARKER = ".reflex-desktop-backend"
 _CARGO_REGION = ("# >>> reflex-desktop plugins >>>", "# <<< reflex-desktop plugins <<<")
 _RS_REGION = ("    // >>> reflex-desktop plugins >>>", "    // <<< reflex-desktop plugins <<<")
 _NOTIFICATION_BRIDGE_DEP = 'notify-rust = "4"'
-_NOTIFICATION_BRIDGE_HANDLER = (
-    "        .invoke_handler(tauri::generate_handler![reflex_desktop_notify])"
-)
 _NOTIFICATION_BRIDGE_PERMISSION = "reflex-desktop-notify"
-_NOTIFICATION_BRIDGE_PERMISSION_TOML = """[[permission]]
-identifier = "reflex-desktop-notify"
-description = "Allows Reflex event handlers to show notifications through the generated bridge."
-commands.allow = ["reflex_desktop_notify"]
-"""
+#: The bridge command that always exists (powers ``reflex_desktop.desktop.notify``).
+_BRIDGE_COMMAND = "reflex_desktop_notify"
+
+
+def _commands_permission_toml(commands: list[str]) -> str:
+    """Render the capability permission that allows the app's own Tauri commands.
+
+    Args:
+        commands: Command names registered in ``generate_handler!``.
+
+    Returns:
+        TOML granting ``commands.allow`` for every command (so the webview may invoke them).
+    """
+    allow = ", ".join(f'"{name}"' for name in commands)
+    return (
+        "[[permission]]\n"
+        f'identifier = "{_NOTIFICATION_BRIDGE_PERMISSION}"\n'
+        'description = "Allows Reflex event handlers to invoke the app\'s Tauri commands '
+        'through the generated bridge."\n'
+        f"commands.allow = [{allow}]\n"
+    )
+
+
+def _command_handler_line(commands: list[str]) -> str:
+    """Render the ``.invoke_handler(generate_handler![...])`` line for ``commands``."""
+    return f"        .invoke_handler(tauri::generate_handler![{', '.join(commands)}])"
 _NOTIFICATION_HELPER_MAIN_GUARD = """    if reflex_desktop_run_notification_helper() {
         return;
     }
@@ -167,6 +186,10 @@ class DesktopPlugin(Plugin):
         extra_capabilities: Additional capability permission strings to grant the main window.
         tauri_dir: Tauri project directory relative to the app root (holds ``src-tauri/``
             and the copied static frontend in ``dist/``).
+        command_stubs: When set, regenerate typed Python bindings for the app's
+            ``#[tauri::command]`` functions on every build (the same output as
+            ``reflex-desktop codegen``). ``True`` writes to ``<app_pkg>/desktop_commands.py``;
+            pass a path (relative to the app root) to choose the location.
     """
 
     backend: BackendMode = "remote"
@@ -194,6 +217,7 @@ class DesktopPlugin(Plugin):
     tauri_plugins: tuple[str, ...] = ()
     extra_capabilities: tuple[str, ...] = ()
     tauri_dir: str = DEFAULT_TAURI_DIR
+    command_stubs: bool | str = False
 
     def _backend_base(self) -> str | None:
         """Return the backend base URL to bake into ``env.json``.
@@ -357,6 +381,8 @@ class DesktopPlugin(Plugin):
         self._apply_capabilities(src_tauri / "capabilities" / "default.json")
         self._apply_plugins(src_tauri)
         self._apply_notification_bridge(src_tauri)
+        if self.command_stubs:
+            self._write_command_stubs(src_tauri)
 
     def _write_gitignore(self, project_root: Path) -> None:
         """Write a ``.gitignore`` for the generated Tauri build artifacts.
@@ -532,7 +558,13 @@ class DesktopPlugin(Plugin):
             )
 
     def _apply_notification_bridge(self, src_tauri: Path) -> None:
-        """Ensure reused scaffolds include the Reflex notification command.
+        """Wire the notification bridge and register every ``#[tauri::command]`` in the app.
+
+        Command registration is derived from the Rust source on every build, so a command is
+        wired into ``generate_handler!`` (and granted the capability to be invoked) simply by
+        existing in ``src-tauri/src`` — no hand-maintained list, and it survives a rebuild.
+        Because this line is fully managed, edits to it by hand are overwritten; add the
+        ``#[tauri::command]`` function and let the build register it.
 
         Args:
             src_tauri: The ``src-tauri`` directory.
@@ -549,29 +581,23 @@ class DesktopPlugin(Plugin):
                     )
                 )
 
-        permission = src_tauri / "permissions" / "reflex-desktop.toml"
-        permission.parent.mkdir(parents=True, exist_ok=True)
-        if (
-            not permission.exists()
-            or permission.read_text() != _NOTIFICATION_BRIDGE_PERMISSION_TOML
-        ):
-            permission.write_text(_NOTIFICATION_BRIDGE_PERMISSION_TOML)
-
         main_rs = src_tauri / "src" / "main.rs"
         if not main_rs.exists():
             return
         text = self._replace_notification_bridge_commands(main_rs.read_text())
+
+        commands = self._registered_commands(text, src_tauri)
+        handler = _command_handler_line(commands)
         text, replaced = re.subn(
-            r"\n\s*\.invoke_handler\(tauri::generate_handler!\[\s*"
-            r"(?:reflex_desktop_terminal_log\s*,\s*)?reflex_desktop_notify\s*\]\)",
-            f"\n{_NOTIFICATION_BRIDGE_HANDLER}",
+            r"[ \t]*\.invoke_handler\(tauri::generate_handler!\[[^\]]*\]\)",
+            handler,
             text,
             count=1,
         )
         if replaced == 0:
             text = text.replace(
                 "tauri::Builder::default()",
-                f"tauri::Builder::default()\n{_NOTIFICATION_BRIDGE_HANDLER}",
+                f"tauri::Builder::default()\n{handler}",
                 1,
             )
         if "reflex_desktop_run_notification_helper() {" not in text:
@@ -581,6 +607,61 @@ class DesktopPlugin(Plugin):
                 1,
             )
         main_rs.write_text(text)
+
+        permission = src_tauri / "permissions" / "reflex-desktop.toml"
+        permission.parent.mkdir(parents=True, exist_ok=True)
+        toml = _commands_permission_toml(commands)
+        if not permission.exists() or permission.read_text() != toml:
+            permission.write_text(toml)
+
+    def _write_command_stubs(self, src_tauri: Path) -> None:
+        """Generate the typed Python bindings module (when ``command_stubs`` is set).
+
+        Args:
+            src_tauri: The ``src-tauri`` directory.
+        """
+        from reflex_base.config import get_config
+        from reflex_base.utils import console
+
+        app_root = Path.cwd()
+        if isinstance(self.command_stubs, str):
+            out = (app_root / self.command_stubs).resolve()
+        else:
+            config = get_config()
+            app_name = getattr(config, "app_name", None) if config else None
+            out = codegen.default_output_path(app_root, app_name)
+
+        module = codegen.render_module(codegen.discover_commands(src_tauri))
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(module)
+        console.info(f"reflex-desktop: wrote command bindings to {out}")
+
+    @staticmethod
+    def _registered_commands(main_rs_text: str, src_tauri: Path) -> list[str]:
+        """Collect every Tauri command to register, in stable order.
+
+        Parses ``main.rs`` from the in-flight text (the notification command was just
+        ensured) plus any other ``.rs`` files on disk, and guarantees the notification bridge
+        command is present even if the user edited it out.
+
+        Args:
+            main_rs_text: Current ``main.rs`` contents (post bridge injection).
+            src_tauri: The ``src-tauri`` directory.
+
+        Returns:
+            Ordered, de-duplicated command names.
+        """
+        names = [c.name for c in codegen.extract_commands(main_rs_text)]
+        src_dir = src_tauri / "src"
+        if src_dir.is_dir():
+            for rs in sorted(src_dir.rglob("*.rs")):
+                if rs.name == "main.rs":
+                    continue
+                names += [c.name for c in codegen.extract_commands(rs.read_text())]
+        if _BRIDGE_COMMAND not in names:
+            names.insert(0, _BRIDGE_COMMAND)
+        seen: set[str] = set()
+        return [n for n in names if not (n in seen or seen.add(n))]
 
     @staticmethod
     def _replace_notification_bridge_commands(text: str) -> str:

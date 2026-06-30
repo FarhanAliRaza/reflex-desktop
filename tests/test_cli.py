@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import os
+import shutil
+from pathlib import Path
+
+from click.testing import CliRunner
 
 from reflex_desktop import cli, desktop
+
+SCAFFOLD = Path(__file__).resolve().parent.parent / "src/reflex_desktop/scaffold/embedded/src-tauri"
 
 
 def _call_script_code(spec) -> str:
@@ -28,6 +34,37 @@ def test_desktop_notify_prefers_reflex_desktop_bridge():
     assert "sendNotification" in script
     assert "terminalLog" not in script
     assert "console.debug" not in script
+
+
+def test_codegen_writes_typed_bindings_for_custom_commands(tmp_path):
+    """`reflex-desktop codegen` emits a typed wrapper for each #[tauri::command]."""
+    src_tauri = tmp_path / "tauri" / "src-tauri"
+    shutil.copytree(SCAFFOLD, src_tauri)
+    main_rs = src_tauri / "src" / "main.rs"
+    main_rs.write_text(
+        main_rs.read_text().replace(
+            "fn main() {",
+            '#[tauri::command]\nfn add(a: i32, b: i32) -> i32 { a + b }\n\nfn main() {',
+            1,
+        )
+    )
+
+    result = CliRunner().invoke(cli.main, ["codegen", "--app-dir", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+
+    generated = (tmp_path / "desktop_commands.py").read_text()
+    assert "def add(a: int, b: int, *, callback" in generated
+    assert 'desktop.invoke("add", {"a": a, "b": b}, callback=callback)' in generated
+    # Internal bridge command is excluded by default.
+    assert "reflex_desktop_notify" not in generated
+    compile(generated, "<generated>", "exec")
+
+
+def test_codegen_errors_without_a_scaffold(tmp_path):
+    """Codegen needs a built/scaffolded Tauri project."""
+    result = CliRunner().invoke(cli.main, ["codegen", "--app-dir", str(tmp_path)])
+    assert result.exit_code != 0
+    assert "run `reflex-desktop build` first" in result.output
 
 
 def test_desnap_env_restores_vscode_snap_originals(monkeypatch):
