@@ -416,8 +416,9 @@ def run(app_dir: str, release: bool, skip_export: bool, skip_build: bool) -> Non
 def codegen_cmd(app_dir: str, out: str | None, include_internal: bool) -> None:
     """Generate typed Python bindings from the app's #[tauri::command] definitions.
 
-    Scans ``<tauri_dir>/src-tauri/src`` and writes a module of typed wrappers so commands
-    can be called as ``desktop_commands.my_command(arg=...)`` instead of a stringly-typed
+    Scans ``<tauri_dir>/src-tauri/src/main.rs`` (the commands the plugin auto-registers)
+    and writes a module of typed wrappers so commands can be called as
+    ``desktop_commands.my_command(arg=...)`` instead of a stringly-typed
     ``desktop.invoke("my_command", {...})``. Run it after adding or changing a command.
 
     Args:

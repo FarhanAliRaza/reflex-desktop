@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from pathlib import Path
@@ -74,6 +75,18 @@ def test_registration_is_idempotent_across_rebuilds(tmp_path):
     assert once == twice
     assert twice.count(".invoke_handler(") == 1
     assert _handler_body(main_rs).count("read_note,") == 1
+
+
+def test_unchanged_main_rs_is_not_rewritten(tmp_path):
+    """A no-op rebuild must not touch main.rs — an mtime bump forces a full cargo recompile."""
+    plugin, src_tauri = _scaffold_with_custom_command(tmp_path)
+    main_rs = src_tauri / "src" / "main.rs"
+
+    plugin._apply_notification_bridge(src_tauri)
+    os.utime(main_rs, (0, 0))
+    plugin._apply_notification_bridge(src_tauri)
+
+    assert main_rs.stat().st_mtime == 0
 
 
 def test_command_in_another_module_is_not_auto_registered(tmp_path):

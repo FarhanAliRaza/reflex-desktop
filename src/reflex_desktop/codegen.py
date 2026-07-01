@@ -1,8 +1,8 @@
 """Generate typed Python bindings from the Rust ``#[tauri::command]`` definitions.
 
-The Rust source under ``src-tauri/src`` is the single source of truth: every
-``#[tauri::command]`` function is parsed into a :class:`Command` (name, arguments, return
-type), which feeds two things:
+``src-tauri/src/main.rs`` is the single source of truth: every ``#[tauri::command]``
+function in it is parsed into a :class:`Command` (name, arguments, return type), which
+feeds two things:
 
 * the plugin's ``generate_handler![...]`` registration (see ``plugin.py``), so a command is
   wired up by virtue of existing in the source — no hand-maintained list, rebuild-safe; and
@@ -163,7 +163,7 @@ def rust_type_to_python(rust: str) -> str:
     base = outer.rsplit("::", 1)[-1]  # `std::string::String` -> `String`
 
     if inner is None:
-        return _SCALAR_TYPES.get(base, "Any" if base not in _SCALAR_TYPES else base)
+        return _SCALAR_TYPES.get(base, "Any")
 
     args = _split_top_level(inner)
     if base == "Option" and len(args) == 1:

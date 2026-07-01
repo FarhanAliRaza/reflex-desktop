@@ -497,7 +497,7 @@ class DesktopPlugin(Plugin):
         for key, value in optional.items():
             if value is not None:
                 window[key] = value
-        conf_path.write_text(json.dumps(conf, indent=2) + "\n")
+        self._write_if_changed(conf_path, json.dumps(conf, indent=2) + "\n")
 
     def _apply_icon(self, src_tauri: Path) -> None:
         """Copy the configured source image over the bundle's icon files.
@@ -517,8 +517,13 @@ class DesktopPlugin(Plugin):
             return
         icons_dir = src_tauri / "icons"
         icons_dir.mkdir(parents=True, exist_ok=True)
+        # Skip identical copies: Tauri's build script watches the icons, so a needless
+        # mtime bump would recompile the crate on every build.
+        data = source.read_bytes()
         for name in ("32x32.png", "128x128.png", "128x128@2x.png", "icon.png"):
-            shutil.copyfile(source, icons_dir / name)
+            dest = icons_dir / name
+            if not dest.exists() or dest.read_bytes() != data:
+                dest.write_bytes(data)
         console.info(
             f"reflex-desktop: applied icon {source.name}; for full platform icons "
             "(.ico/.icns + every size) run `cargo tauri icon <path>` in src-tauri."
@@ -564,7 +569,7 @@ class DesktopPlugin(Plugin):
         seen: set[str] = set()
         cap["permissions"] = [p for p in perms if not (p in seen or seen.add(p))]
         cap_path.parent.mkdir(parents=True, exist_ok=True)
-        cap_path.write_text(json.dumps(cap, indent=2) + "\n")
+        self._write_if_changed(cap_path, json.dumps(cap, indent=2) + "\n")
 
     def _apply_plugins(self, src_tauri: Path) -> None:
         """Inject the configured extra Tauri plugins into ``Cargo.toml`` and ``main.rs``.
@@ -582,21 +587,23 @@ class DesktopPlugin(Plugin):
         )
         cargo = src_tauri / "Cargo.toml"
         if cargo.exists():
-            cargo.write_text(
+            self._write_if_changed(
+                cargo,
                 self._set_region(
                     cargo.read_text(), _CARGO_REGION[0], _CARGO_REGION[1], "[dependencies]", deps
-                )
+                ),
             )
         main_rs = src_tauri / "src" / "main.rs"
         if main_rs.exists():
-            main_rs.write_text(
+            self._write_if_changed(
+                main_rs,
                 self._set_region(
                     main_rs.read_text(),
                     _RS_REGION[0],
                     _RS_REGION[1],
                     "tauri::Builder::default()",
                     registrations,
-                )
+                ),
             )
 
     def _apply_notification_bridge(self, src_tauri: Path) -> list[codegen.Command]:
@@ -647,13 +654,11 @@ class DesktopPlugin(Plugin):
         names = [n for n in names if not (n in seen or seen.add(n))]
 
         text = self._set_command_region(text, names)
-        main_rs.write_text(text)
+        self._write_if_changed(main_rs, text)
 
         permission = src_tauri / "permissions" / "reflex-desktop.toml"
         permission.parent.mkdir(parents=True, exist_ok=True)
-        toml = _commands_permission_toml(names)
-        if not permission.exists() or permission.read_text() != toml:
-            permission.write_text(toml)
+        self._write_if_changed(permission, _commands_permission_toml(names))
         return commands
 
     @staticmethod
@@ -701,7 +706,7 @@ class DesktopPlugin(Plugin):
         override = self.command_stubs if isinstance(self.command_stubs, str) else None
         out = codegen.resolve_output_path(Path.cwd(), override)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(codegen.render_module(commands))
+        self._write_if_changed(out, codegen.render_module(commands))
         console.info(f"reflex-desktop: wrote command bindings to {out}")
 
     @staticmethod
@@ -741,6 +746,22 @@ class DesktopPlugin(Plugin):
                 1,
             )
         return text
+
+    @staticmethod
+    def _write_if_changed(path: Path, content: str) -> None:
+        """Write ``content`` only when it differs from what's on disk.
+
+        The configure step runs on every build; writing identical content anyway would bump
+        the file's mtime, and for ``main.rs``/``Cargo.toml`` that makes cargo recompile the
+        whole crate even when nothing changed.
+
+        Args:
+            path: Destination file.
+            content: The content the file should have.
+        """
+        if path.exists() and path.read_text() == content:
+            return
+        path.write_text(content)
 
     @staticmethod
     def _set_region(text: str, begin: str, end: str, anchor: str, body: str) -> str:
