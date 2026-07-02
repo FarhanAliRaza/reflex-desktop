@@ -83,9 +83,14 @@ jobs:
           # embedded backend on the baked-in port. The baked env.json is bundled into
           # the compiled JS (not shipped as a file), so read the port from the
           # generated shell source instead.
-          PORT=$(grep -oE 'BACKEND_PORT: u16 = [0-9]+' tauri/src-tauri/src/main.rs | grep -oE '[0-9]+')
+          PORT=$(sed -nE 's/.*BACKEND_PORT: u16 = ([0-9]+);.*/\1/p' tauri/src-tauri/src/main.rs)
           PING="http://127.0.0.1:$PORT/ping"
           echo "polling $PING"
+          # The binary also carries the build tree's absolute rpath (for dev runs).
+          # Move the build-tree runtime away so the installed app can only resolve
+          # libpython through the $ORIGIN-relative rpath — otherwise this test would
+          # pass on the build machine without proving relocation.
+          mv tauri/src-tauri/python tauri/src-tauri/python.hidden
           export WEBKIT_DISABLE_COMPOSITING_MODE=1
           xvfb-run -a reflex-counter &
           APP_PID=$!

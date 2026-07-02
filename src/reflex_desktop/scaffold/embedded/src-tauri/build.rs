@@ -48,11 +48,28 @@ fn configure_libpython_linking(interpreter: &Path) {
             "cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Resources/python/python/lib"
         );
     } else {
-        // deb/rpm install the binary at /usr/bin/<bin> with resources at
-        // /usr/lib/<bin>/; an AppImage mirrors the same usr/ tree inside its AppDir.
-        let bin_name = std::env::var("CARGO_PKG_NAME").unwrap_or_default();
-        println!(
-            "cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib/{bin_name}/python/python/lib"
-        );
+        // deb/rpm install the binary at /usr/bin/<bin> with resources under /usr/lib/;
+        // an AppImage mirrors the same usr/ tree inside its AppDir. Tauri's bundler names
+        // the lib dir after the *product name* (verified: "/usr/lib/Reflex Counter"), but
+        // emit an entry for the binary/crate name too in case that ever changes.
+        println!("cargo:rerun-if-changed=tauri.conf.json");
+        let mut names: Vec<String> = Vec::new();
+        if let Some(product) = product_name() {
+            names.push(product);
+        }
+        if let Ok(bin_name) = std::env::var("CARGO_PKG_NAME") {
+            if !names.contains(&bin_name) {
+                names.push(bin_name);
+            }
+        }
+        for name in names {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib/{name}/python/python/lib");
+        }
     }
+}
+
+fn product_name() -> Option<String> {
+    let conf = std::fs::read_to_string("tauri.conf.json").ok()?;
+    let value: serde_json::Value = serde_json::from_str(&conf).ok()?;
+    Some(value.get("productName")?.as_str()?.to_string())
 }
