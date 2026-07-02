@@ -149,11 +149,16 @@ def _stdlib_dir(python_dir: Path) -> Path | None:
         The stdlib directory, or ``None`` if the layout is unrecognized.
     """
     root = python_dir / "python"
-    win_lib = root / "Lib"
-    if win_lib.is_dir():
-        return win_lib
-    lib = root / "lib"
-    if lib.is_dir():
+    if not root.is_dir():
+        return None
+    # Match directory names exactly (via iterdir) rather than probing paths: on a
+    # case-insensitive filesystem (macOS, Windows) a probe for the Windows-layout "Lib"
+    # would match a unix-layout "lib" and return the wrong level.
+    entries = {entry.name: entry for entry in root.iterdir() if entry.is_dir()}
+    if "Lib" in entries:
+        return entries["Lib"]
+    lib = entries.get("lib")
+    if lib is not None:
         for entry in sorted(lib.iterdir()):
             if entry.is_dir() and entry.name.startswith("python"):
                 return entry
@@ -311,7 +316,12 @@ def copy_app_payload(app_root: Path, dest: Path) -> None:
     app_name = get_config().app_name
     pkg = app_root / app_name
     if pkg.is_dir():
-        shutil.copytree(pkg, dest / app_name, dirs_exist_ok=True)
+        shutil.copytree(
+            pkg,
+            dest / app_name,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
 
     shutil.copy2(Path(__file__).parent / "bootstrap.py", dest / "reflex_desktop_bootstrap.py")
 

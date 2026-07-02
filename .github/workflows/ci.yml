@@ -80,8 +80,11 @@ jobs:
           sudo dpkg -i tauri/src-tauri/target/debug/bundle/deb/*.deb
           # The acid test for relocatability: the installed binary (at /usr/bin, far
           # from the build tree) must resolve the bundled libpython and boot the
-          # embedded backend, answered on the port baked into env.json.
-          PING=$(python3 -c "import json; print(json.load(open('tauri/dist/env.json'))['PING'])")
+          # embedded backend on the baked-in port. The baked env.json is bundled into
+          # the compiled JS (not shipped as a file), so read the port from the
+          # generated shell source instead.
+          PORT=$(grep -oE 'BACKEND_PORT: u16 = [0-9]+' tauri/src-tauri/src/main.rs | grep -oE '[0-9]+')
+          PING="http://127.0.0.1:$PORT/ping"
           echo "polling $PING"
           export WEBKIT_DISABLE_COMPOSITING_MODE=1
           xvfb-run -a reflex-counter &
