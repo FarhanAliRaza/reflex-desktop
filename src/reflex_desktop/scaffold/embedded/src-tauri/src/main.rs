@@ -162,7 +162,10 @@ fn main() {
                 let _ = window.set_focus();
             }
         }))
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            // >>> reflex-desktop setup >>>
+            // <<< reflex-desktop setup <<<
             // A bundled app finds its resources via Tauri's resource_dir(); an in-place dev
             // build (bare `cargo build`, launched by `reflex-desktop run`) has its resources in
             // the crate dir, which the CLI passes via REFLEX_DESKTOP_RESOURCE_DIR.
@@ -180,9 +183,27 @@ fn main() {
             std::env::set_var("PYTHONNOUSERSITE", "1");
 
             if !port_available(BACKEND_PORT) {
-                eprintln!(
-                    "reflex-desktop: 127.0.0.1:{BACKEND_PORT} is busy; another instance may be running."
+                // Same-app relaunches are already handled by the single-instance plugin
+                // (the second instance focuses the first and exits), so a busy port means
+                // some other program owns it. A desktop launch has no visible stderr, so
+                // surface the conflict in a native dialog before bailing out.
+                use tauri_plugin_dialog::DialogExt;
+                let product = app
+                    .config()
+                    .product_name
+                    .clone()
+                    .unwrap_or_else(|| "This app".to_string());
+                let message = format!(
+                    "{product} could not start: port 127.0.0.1:{BACKEND_PORT} is already in \
+                     use by another program.\n\nClose the program using that port and launch \
+                     {product} again."
                 );
+                eprintln!("reflex-desktop: {message}");
+                app.dialog()
+                    .message(message)
+                    .kind(tauri_plugin_dialog::MessageDialogKind::Error)
+                    .title(format!("{product} failed to start"))
+                    .blocking_show();
                 std::process::exit(1);
             }
 

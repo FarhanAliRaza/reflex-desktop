@@ -111,10 +111,11 @@ That's it — a native window with your app inside. The first build pulls down a
 Python interpreter and compiles the Rust shell, so it takes a few minutes; everything after
 that is quick.
 
-> **A note on iterating:** for day-to-day development, use plain `reflex run` — the normal
-> Reflex dev server with hot reload, in your browser. The app code is identical. Only switch
-> to `reflex-desktop` when you're ready to package and smoke-test the desktop build. See
-> [Limitations](#limitations) for why.
+> **A note on iterating:** for pure UI/backend work, plain `reflex run` (browser, hot
+> reload) is still the fastest loop — the app code is identical. The moment you use a
+> native feature (`desktop.notify`, window controls, dialogs, `invoke`), switch to
+> `reflex-desktop dev`: the same hot-reloading dev server, but inside the real Tauri
+> webview where `window.__TAURI__` exists.
 
 There's a fuller, multi-page example (background events, forms, native window controls) in
 [`example/`](example/) if you want something less trivial to poke at.
@@ -124,12 +125,18 @@ There's a fuller, multi-page example (background events, forms, native window co
 ## Commands
 
 ```bash
+reflex-desktop dev                # hot reload inside the real desktop webview
 reflex-desktop run                # build the app, then launch it
 reflex-desktop run --skip-build   # relaunch an already-built app, no recompile
 reflex-desktop build              # build only (release)
 reflex-desktop build --bundle     # also produce installers (.dmg/.msi/.AppImage/.deb)
 reflex-desktop doctor             # check your machine has what it needs to build
 ```
+
+`dev` starts the normal `reflex run` dev server, then opens a Tauri shell pointed at it —
+edit your Python and the window hot-reloads, while native bridge features
+(`window.__TAURI__`) keep working. The dev shell lives in `<app>/tauri-dev/` and only
+compiles Rust the first time (it needs the Tauri CLI, like `--bundle`).
 
 `run` does a fast **debug** build by default (like `cargo run`); add `--release` for an
 optimized one. `build` defaults to **release**. The generated Tauri project lives under
@@ -157,7 +164,7 @@ shell from source — a `pip install` can't ship you a compiler. This is the sta
 | **Linux** | `libwebkit2gtk-4.1-dev`, `build-essential`, `libssl-dev`, `librsvg2-dev`, `libayatana-appindicator3-dev`, plus `curl`/`wget`/`file` |
 | **macOS** | Xcode Command Line Tools (`xcode-select --install`) |
 | **Windows** | Microsoft C++ Build Tools (MSVC) + the WebView2 runtime |
-| **`--bundle`** | the Tauri CLI: `cargo install tauri-cli --locked` |
+| **`--bundle` / `dev`** | the Tauri CLI: `cargo install tauri-cli --locked` (prebuilt: `cargo binstall tauri-cli`) |
 | **`embedded`** | a network connection on the *first* build (it downloads an interpreter and installs the backend) |
 
 Package names drift between distros — Tauri's
@@ -188,11 +195,18 @@ DesktopPlugin(
     resizable=True, min_width=900, min_height=650, center=True,
     theme="Dark",                    # + fullscreen / decorations / transparent / always_on_top
     icon="assets/logo.png",          # a PNG, copied over the bundle icons
+    tray=True,                       # system tray icon with a Show / Quit menu
     with_global_tauri=True,          # default — exposes window.__TAURI__ for the bridge below
-    tauri_plugins=("notification",), # pulls in tauri-plugin-<name>, wired up + permissioned
+    tauri_plugins=("notification", "dialog", "clipboard-manager"),
     extra_capabilities=("os:default",),
 )
 ```
+
+**Ports.** In `embedded` mode the backend binds a loopback port baked into the build. The
+default is derived from your app's `identifier`, so two installed reflex-desktop apps
+don't collide; pass `port=...` to pin one explicitly. If something else already owns the
+port at launch, the app explains that in a native error dialog (a second launch of the
+*same* app just focuses the running window).
 
 **Icons.** `icon=` copies one PNG over the four default bundle icons. For the full platform
 set (`.ico`/`.icns` and every size), run
@@ -209,7 +223,30 @@ rx.button("minimize", on_click=desktop.minimize())
 rx.button("max/restore", on_click=desktop.toggle_maximize())
 rx.button("close", on_click=desktop.close())
 rx.button("notify", on_click=desktop.notify("Title", "Body"))  # needs tauri_plugins=("notification",)
+
+# Native file dialogs (needs tauri_plugins=("dialog",)) — the picked path arrives in
+# a normal event handler, and since the backend runs locally you can open() it directly:
+rx.button("open…", on_click=desktop.open_file(State.handle_path, filters={"CSV": ["csv"]}))
+rx.button("save as…", on_click=desktop.save_file(State.handle_save, default_path="report.csv"))
+
+# Clipboard (needs tauri_plugins=("clipboard-manager",)):
+rx.button("copy", on_click=desktop.clipboard_write("hello"))
+rx.button("paste", on_click=desktop.clipboard_read(State.handle_clipboard))
+
+# Any custom #[tauri::command] you added to main.rs:
+rx.button("go", on_click=desktop.invoke("my_command", {"file_path": "/tmp/x"}))
 ```
+
+`desktop.invoke()` converts argument names to the camelCase spellings Tauri expects on
+the wire (`file_path` → `filePath`), which is the classic silent failure when calling
+commands by hand; pass `convert_keys=False` if your command is declared with
+`#[tauri::command(rename_all = "snake_case")]`.
+
+**Auto-updates & signing.** `tauri_plugins=("updater",)` plus
+`updater_endpoints=(...)`/`updater_pubkey=...` wires Tauri's updater into the shell and
+turns on signed update artifacts at bundle time — see [docs/updater.md](docs/updater.md).
+OS code signing / macOS notarization is env-var driven at `--bundle` time — see
+[docs/signing.md](docs/signing.md).
 
 `desktop.notify()` asks for OS notification permission before sending (otherwise it's a
 silent no-op on macOS/Windows). On Linux, a *bundled* app (`--bundle`, which installs a
@@ -223,28 +260,28 @@ Tauri project, so add crates, edit `main.rs`, whatever you need.
 
 ## Limitations
 
-`reflex-desktop` packages a **production build**. It is not a live dev environment, and on
-purpose:
-
-- **No hot reload.** The window loads a *prebuilt static* frontend, and the embedded backend
-  starts without recompiling, so editing your app doesn't live-update the running window.
-- **Every build is a full build.** There's no incremental loop yet — each `run`/`build`
-  re-exports the frontend and compiles the Tauri binary (debug is faster than release, but
-  it's still a `cargo` compile).
-- **`reflex-desktop dev` isn't implemented.** v1 is build-only; a live desktop dev mode may
-  come later.
-
-So: **develop with `reflex run`** (browser, hot reload, fast), and use `reflex-desktop` to
-package and test the desktop build when you're ready to ship.
+- **`reflex-desktop run`/`build` package a production build** — the window loads a
+  prebuilt static frontend, so editing code doesn't live-update it. That's what
+  `reflex-desktop dev` is for: the hot-reloading dev server inside the real webview.
+- **`dev` uses the dev server as the backend**, so the embedded in-process interpreter
+  isn't exercised until you do a real `run`/`build`. Smoke-test the built app before
+  shipping.
+- **The dev shell compiles Rust once** (first `dev` invocation) and whenever you change
+  native config (tray, plugins). Pure Python edits never recompile.
 
 ### What's solid vs. still in progress
 
 - **`remote`** — done and verified end-to-end.
-- **`embedded`** — works end-to-end as an in-place (dev) build: the binary boots a bundled
-  interpreter in-process and serves your Reflex backend locally. Producing a fully
-  *relocatable* installer (an installed `.app`/AppImage you can move to another machine)
-  still has a few loose ends — a relocation-safe library path for the bundled interpreter,
-  macOS signing, and trimming the bundle size.
+- **`embedded`** — self-contained builds and installers: the binary boots a bundled
+  interpreter in-process and serves your Reflex backend locally. Installed bundles find
+  the bundled interpreter through relative library paths (`$ORIGIN` on Linux,
+  `@rpath`/`@executable_path` on macOS, exe-adjacent DLLs on Windows), the backend
+  dependencies are pinned to the exact reflex version you built with, and unused runtime
+  pieces (stdlib test suite, Tcl/Tk, bytecode caches) are trimmed from the bundle. CI
+  installs the built `.deb` and boots the embedded backend from the installed location on
+  every push.
+- **macOS/Windows** builds compile in CI; broader real-hardware validation (and signing —
+  see [docs/signing.md](docs/signing.md)) is on you for now.
 
 > **Heads up for snap users:** if you build from a snap-confined terminal (e.g. VS Code
 > installed via snap), the launched binary would otherwise inherit the snap's GTK/locale
