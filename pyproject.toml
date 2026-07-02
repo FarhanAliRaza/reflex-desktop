@@ -3,6 +3,8 @@ name = "reflex-desktop"
 version = "0.2.0"
 description = "Package a Reflex app as a native desktop app with Tauri."
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 keywords = ["reflex", "tauri", "desktop", "packaging"]
 classifiers = [
