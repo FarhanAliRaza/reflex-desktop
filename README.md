@@ -128,6 +128,7 @@ reflex-desktop run                # build the app, then launch it
 reflex-desktop run --skip-build   # relaunch an already-built app, no recompile
 reflex-desktop build              # build only (release)
 reflex-desktop build --bundle     # also produce installers (.dmg/.msi/.AppImage/.deb)
+reflex-desktop codegen            # generate typed Python bindings for your Tauri commands
 reflex-desktop doctor             # check your machine has what it needs to build
 ```
 
@@ -216,8 +217,96 @@ silent no-op on macOS/Windows). On Linux, a *bundled* app (`--bundle`, which ins
 `.desktop` entry) shows banners reliably; a bare dev binary may route them to the
 notification tray instead.
 
-Anything the plugin doesn't cover, you can still do by hand — `src-tauri/` is a standard
-Tauri project, so add crates, edit `main.rs`, whatever you need.
+**Calling native code: `desktop.invoke()`.** The window helpers above are convenience
+wrappers; `desktop.invoke()` is the general escape hatch to any Tauri command, so you don't
+have to hand-write `rx.call_script("window.__TAURI__.core.invoke(...)")`. Pass arguments as a
+dict and, if you want the result back, a `callback` — the returned promise is resolved before
+your handler runs:
+
+```python
+from reflex_desktop import desktop
+
+# a Tauri plugin command — enable the plugin first: tauri_plugins=("fs",)
+rx.button(
+    "read file",
+    on_click=desktop.invoke(
+        "plugin:fs|read_text_file",
+        {"path": "/etc/hostname"},
+        callback=State.on_file_read,   # State.on_file_read(self, contents)
+    ),
+)
+
+# your own #[tauri::command]
+rx.button("do native thing", on_click=desktop.invoke("my_command", {"x": 1}))
+```
+
+> **Note on the `embedded` backend:** because the Python backend runs *in-process on the
+> user's machine*, you usually don't need the bridge at all for system access — just use
+> plain Python in an event handler (`open()`, `pathlib`, `subprocess`, …), running with the
+> user's own privileges. Reach for `desktop.invoke()` when you specifically want the
+> *webview/Tauri* side (native dialogs, OS integration, a Rust command). In `remote` mode,
+> where Python runs on a server, the bridge is the only way to touch the local machine.
+> For slow filesystem/subprocess work in an event handler, use a Reflex background event
+> (`@rx.event(background=True)`) so you don't block the backend's event loop.
+
+### Adding your own Rust command (and calling it type-safely)
+
+`src-tauri/` is a standard Tauri project, so you add native code the normal Tauri way — just
+write the command in `main.rs`. **You don't register it by hand:** on every build,
+reflex-desktop reads the `#[tauri::command]` functions in `main.rs` and rewrites a managed
+region inside `generate_handler!` to register each one (and grants it the capability to be
+invoked). Add the function, and it's live on the next build — rebuild-safe, no list to maintain.
+
+```rust
+// src-tauri/src/main.rs — add the command; the build registers it for you.
+#[tauri::command(rename_all = "snake_case")]
+fn read_note(file_path: String) -> Result<String, String> {
+    std::fs::read_to_string(&file_path).map_err(|e| e.to_string())
+}
+```
+
+Only `main.rs` is scanned, because `generate_handler!` references commands unqualified and
+they must be in scope there. If you'd rather keep commands in their own module, that's fine —
+register them yourself by adding the qualified path inside the macro, *outside* the managed
+markers (the build leaves your additions alone):
+
+```rust
+.invoke_handler(tauri::generate_handler![
+    // >>> reflex-desktop commands >>>
+    reflex_desktop_notify,
+    read_note,
+    // <<< reflex-desktop commands <<<
+    commands::open_db,   // your own — preserved across rebuilds
+])
+```
+
+Then generate a **typed Python binding** from that Rust signature so the call site is
+checked and autocompleted instead of stringly-typed:
+
+```bash
+reflex-desktop codegen      # writes <app_pkg>/desktop_commands.py
+```
+
+```python
+from my_app import desktop_commands as native
+
+# read_note(file_path: str) -> str  — the signature is generated from the Rust source
+rx.button("open", on_click=native.read_note(file_path="/notes/today.md", callback=State.on_note))
+```
+
+The generator maps Rust types to Python (`String`→`str`, `Option<T>`→`T | None`,
+`Vec<T>`→`list[T]`, `Result<T, E>`→`T`, …), drops Tauri-injected arguments
+(`AppHandle`/`Window`/`State`), and records the return type so you know what your `callback`
+receives. Re-run it whenever a signature changes — or set `DesktopPlugin(command_stubs=True)`
+to regenerate automatically on every build.
+
+> **One Tauri gotcha:** annotate commands with `#[tauri::command(rename_all = "snake_case")]`
+> so the argument names on the wire match the Rust names — that's what the generated bindings
+> (and `desktop.invoke`) send.
+
+If you'd rather not add Rust at all, official Tauri plugins via `tauri_plugins=(...)` are also
+rebuild-safe — enable one and call it with `desktop.invoke("plugin:<name>|<command>", ...)`.
+And anything the plugin doesn't cover you can still do by hand in `src-tauri/`.
 
 ---
 

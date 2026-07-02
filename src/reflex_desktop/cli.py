@@ -15,7 +15,7 @@ from pathlib import Path
 
 import click
 
-from . import preflight
+from . import codegen, preflight
 from .config import DEFAULT_TAURI_DIR, slugify
 
 
@@ -398,6 +398,54 @@ def run(app_dir: str, release: bool, skip_export: bool, skip_build: bool) -> Non
     _install_desktop_entry(plugin, src_tauri, binary)
     click.echo(f"reflex-desktop: launching {binary}")
     _run([str(binary)], cwd=src_tauri.parent.parent, env=launch_env)
+
+
+@main.command("codegen")
+@click.option("--app-dir", default=".", help="App root containing rxconfig.py.")
+@click.option(
+    "--out",
+    default=None,
+    help="Output path for the bindings module (default: <app_pkg>/desktop_commands.py).",
+)
+@click.option(
+    "--include-internal",
+    is_flag=True,
+    default=False,
+    help="Also emit reflex-desktop's own bridge commands (reflex_desktop_*).",
+)
+def codegen_cmd(app_dir: str, out: str | None, include_internal: bool) -> None:
+    """Generate typed Python bindings from the app's #[tauri::command] definitions.
+
+    Scans ``<tauri_dir>/src-tauri/src/main.rs`` (the commands the plugin auto-registers)
+    and writes a module of typed wrappers so commands can be called as
+    ``desktop_commands.my_command(arg=...)`` instead of a stringly-typed
+    ``desktop.invoke("my_command", {...})``. Run it after adding or changing a command.
+
+    Args:
+        app_dir: App root containing rxconfig.py.
+        out: Where to write the generated module; defaults to the app package.
+        include_internal: Include reflex-desktop's own bridge commands.
+
+    Raises:
+        ClickException: If no Tauri project has been scaffolded yet.
+    """
+    app_root = Path(app_dir).resolve()
+    os.chdir(app_root)
+    plugin = _find_plugin(app_root)
+    tauri_dir = plugin.tauri_dir if plugin else DEFAULT_TAURI_DIR
+    src_tauri = app_root / tauri_dir / "src-tauri"
+    if not src_tauri.is_dir():
+        raise click.ClickException(
+            f"no Tauri project at {src_tauri}; run `reflex-desktop build` first."
+        )
+
+    commands = codegen.discover_commands(src_tauri)
+    module = codegen.render_module(commands, include_internal=include_internal)
+    out_path = codegen.resolve_output_path(app_root, out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(module)
+    shown = codegen.public_commands(commands, include_internal=include_internal)
+    click.echo(f"reflex-desktop: wrote {len(shown)} command binding(s) to {out_path}")
 
 
 @main.command()

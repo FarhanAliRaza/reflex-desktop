@@ -11,6 +11,7 @@ from typing import Literal
 
 from reflex.plugins import Plugin
 
+from . import codegen
 from .config import DEFAULT_PORT, DEFAULT_TAURI_DIR, LOOPBACK_HOST, slugify
 
 BackendMode = Literal["remote", "embedded"]
@@ -25,15 +26,75 @@ _BACKEND_MARKER = ".reflex-desktop-backend"
 _CARGO_REGION = ("# >>> reflex-desktop plugins >>>", "# <<< reflex-desktop plugins <<<")
 _RS_REGION = ("    // >>> reflex-desktop plugins >>>", "    // <<< reflex-desktop plugins <<<")
 _NOTIFICATION_BRIDGE_DEP = 'notify-rust = "4"'
-_NOTIFICATION_BRIDGE_HANDLER = (
-    "        .invoke_handler(tauri::generate_handler![reflex_desktop_notify])"
-)
 _NOTIFICATION_BRIDGE_PERMISSION = "reflex-desktop-notify"
-_NOTIFICATION_BRIDGE_PERMISSION_TOML = """[[permission]]
-identifier = "reflex-desktop-notify"
-description = "Allows Reflex event handlers to show notifications through the generated bridge."
-commands.allow = ["reflex_desktop_notify"]
-"""
+#: The bridge command that always exists (powers ``reflex_desktop.desktop.notify``).
+_BRIDGE_COMMAND = "reflex_desktop_notify"
+# Managed region (comment markers) holding the auto-registered command list *inside* the
+# generate_handler! macro. Indented to sit at the macro's body level. Commands a user adds
+# outside this region but inside the macro are preserved across rebuilds.
+_RS_COMMANDS_REGION = (
+    "            // >>> reflex-desktop commands >>>",
+    "            // <<< reflex-desktop commands <<<",
+)
+
+
+def _commands_permission_toml(commands: list[str]) -> str:
+    """Render the capability permission that allows the app's own Tauri commands.
+
+    Args:
+        commands: Command names registered in ``generate_handler!``.
+
+    Returns:
+        TOML granting ``commands.allow`` for every command (so the webview may invoke them).
+    """
+    allow = ", ".join(f'"{name}"' for name in commands)
+    return (
+        "[[permission]]\n"
+        f'identifier = "{_NOTIFICATION_BRIDGE_PERMISSION}"\n'
+        'description = "Allows Reflex event handlers to invoke the app\'s Tauri commands '
+        'through the generated bridge."\n'
+        f"commands.allow = [{allow}]\n"
+    )
+
+
+def _render_invoke_handler(commands: list[str]) -> str:
+    """Render the full ``.invoke_handler(generate_handler![...])`` call with the managed region.
+
+    Args:
+        commands: Command names to register.
+
+    Returns:
+        The Rust call text, markers included, indented for the ``tauri::Builder`` chain.
+    """
+    begin, end = _RS_COMMANDS_REGION
+    body = "\n".join(f"            {name}," for name in commands)
+    return (
+        "        .invoke_handler(tauri::generate_handler![\n"
+        f"{begin}\n{body}\n{end}\n"
+        "        ])"
+    )
+
+
+def _invoke_handler_span(text: str) -> tuple[int, int] | None:
+    """Locate the existing ``.invoke_handler(...)`` call via balanced parens.
+
+    Args:
+        text: ``main.rs`` contents.
+
+    Returns:
+        ``(start, end)`` spanning the call including its leading indentation, or ``None``.
+    """
+    key = ".invoke_handler("
+    idx = text.find(key)
+    if idx == -1:
+        return None
+    end = codegen.scan_balanced(text, idx + len(key) - 1, "(", ")")
+    if end == -1:
+        return None
+    line_start = text.rfind("\n", 0, idx) + 1
+    return line_start, end
+
+
 _NOTIFICATION_HELPER_MAIN_GUARD = """    if reflex_desktop_run_notification_helper() {
         return;
     }
@@ -167,6 +228,10 @@ class DesktopPlugin(Plugin):
         extra_capabilities: Additional capability permission strings to grant the main window.
         tauri_dir: Tauri project directory relative to the app root (holds ``src-tauri/``
             and the copied static frontend in ``dist/``).
+        command_stubs: When set, regenerate typed Python bindings for the app's
+            ``#[tauri::command]`` functions on every build (the same output as
+            ``reflex-desktop codegen``). ``True`` writes to ``<app_pkg>/desktop_commands.py``;
+            pass a path (relative to the app root) to choose the location.
     """
 
     backend: BackendMode = "remote"
@@ -194,6 +259,7 @@ class DesktopPlugin(Plugin):
     tauri_plugins: tuple[str, ...] = ()
     extra_capabilities: tuple[str, ...] = ()
     tauri_dir: str = DEFAULT_TAURI_DIR
+    command_stubs: bool | str = False
 
     def _backend_base(self) -> str | None:
         """Return the backend base URL to bake into ``env.json``.
@@ -356,7 +422,9 @@ class DesktopPlugin(Plugin):
         self._apply_icon(src_tauri)
         self._apply_capabilities(src_tauri / "capabilities" / "default.json")
         self._apply_plugins(src_tauri)
-        self._apply_notification_bridge(src_tauri)
+        commands = self._apply_notification_bridge(src_tauri)
+        if self.command_stubs:
+            self._write_command_stubs(commands)
 
     def _write_gitignore(self, project_root: Path) -> None:
         """Write a ``.gitignore`` for the generated Tauri build artifacts.
@@ -429,7 +497,7 @@ class DesktopPlugin(Plugin):
         for key, value in optional.items():
             if value is not None:
                 window[key] = value
-        conf_path.write_text(json.dumps(conf, indent=2) + "\n")
+        self._write_if_changed(conf_path, json.dumps(conf, indent=2) + "\n")
 
     def _apply_icon(self, src_tauri: Path) -> None:
         """Copy the configured source image over the bundle's icon files.
@@ -449,8 +517,13 @@ class DesktopPlugin(Plugin):
             return
         icons_dir = src_tauri / "icons"
         icons_dir.mkdir(parents=True, exist_ok=True)
+        # Skip identical copies: Tauri's build script watches the icons, so a needless
+        # mtime bump would recompile the crate on every build.
+        data = source.read_bytes()
         for name in ("32x32.png", "128x128.png", "128x128@2x.png", "icon.png"):
-            shutil.copyfile(source, icons_dir / name)
+            dest = icons_dir / name
+            if not dest.exists() or dest.read_bytes() != data:
+                dest.write_bytes(data)
         console.info(
             f"reflex-desktop: applied icon {source.name}; for full platform icons "
             "(.ico/.icns + every size) run `cargo tauri icon <path>` in src-tauri."
@@ -496,7 +569,7 @@ class DesktopPlugin(Plugin):
         seen: set[str] = set()
         cap["permissions"] = [p for p in perms if not (p in seen or seen.add(p))]
         cap_path.parent.mkdir(parents=True, exist_ok=True)
-        cap_path.write_text(json.dumps(cap, indent=2) + "\n")
+        self._write_if_changed(cap_path, json.dumps(cap, indent=2) + "\n")
 
     def _apply_plugins(self, src_tauri: Path) -> None:
         """Inject the configured extra Tauri plugins into ``Cargo.toml`` and ``main.rs``.
@@ -514,28 +587,40 @@ class DesktopPlugin(Plugin):
         )
         cargo = src_tauri / "Cargo.toml"
         if cargo.exists():
-            cargo.write_text(
+            self._write_if_changed(
+                cargo,
                 self._set_region(
                     cargo.read_text(), _CARGO_REGION[0], _CARGO_REGION[1], "[dependencies]", deps
-                )
+                ),
             )
         main_rs = src_tauri / "src" / "main.rs"
         if main_rs.exists():
-            main_rs.write_text(
+            self._write_if_changed(
+                main_rs,
                 self._set_region(
                     main_rs.read_text(),
                     _RS_REGION[0],
                     _RS_REGION[1],
                     "tauri::Builder::default()",
                     registrations,
-                )
+                ),
             )
 
-    def _apply_notification_bridge(self, src_tauri: Path) -> None:
-        """Ensure reused scaffolds include the Reflex notification command.
+    def _apply_notification_bridge(self, src_tauri: Path) -> list[codegen.Command]:
+        """Wire the notification bridge and register the app's ``main.rs`` Tauri commands.
+
+        Registration is derived from ``main.rs`` on every build, so a command is wired into
+        ``generate_handler!`` (and granted the capability to be invoked) simply by existing
+        there — no hand-maintained list, and it survives rebuilds. Only ``main.rs`` is scanned
+        because ``generate_handler!`` references commands unqualified; a command a user splits
+        into another module must be registered (and qualified) by hand, which the managed
+        region inside the macro leaves room for.
 
         Args:
             src_tauri: The ``src-tauri`` directory.
+
+        Returns:
+            The commands parsed from ``main.rs`` (reused for binding generation).
         """
         cargo = src_tauri / "Cargo.toml"
         if cargo.exists():
@@ -549,38 +634,80 @@ class DesktopPlugin(Plugin):
                     )
                 )
 
-        permission = src_tauri / "permissions" / "reflex-desktop.toml"
-        permission.parent.mkdir(parents=True, exist_ok=True)
-        if (
-            not permission.exists()
-            or permission.read_text() != _NOTIFICATION_BRIDGE_PERMISSION_TOML
-        ):
-            permission.write_text(_NOTIFICATION_BRIDGE_PERMISSION_TOML)
-
         main_rs = src_tauri / "src" / "main.rs"
         if not main_rs.exists():
-            return
+            return []
         text = self._replace_notification_bridge_commands(main_rs.read_text())
-        text, replaced = re.subn(
-            r"\n\s*\.invoke_handler\(tauri::generate_handler!\[\s*"
-            r"(?:reflex_desktop_terminal_log\s*,\s*)?reflex_desktop_notify\s*\]\)",
-            f"\n{_NOTIFICATION_BRIDGE_HANDLER}",
-            text,
-            count=1,
-        )
-        if replaced == 0:
-            text = text.replace(
-                "tauri::Builder::default()",
-                f"tauri::Builder::default()\n{_NOTIFICATION_BRIDGE_HANDLER}",
-                1,
-            )
         if "reflex_desktop_run_notification_helper() {" not in text:
             text = text.replace(
                 "fn main() {\n",
                 f"fn main() {{\n{_NOTIFICATION_HELPER_MAIN_GUARD}\n",
                 1,
             )
-        main_rs.write_text(text)
+
+        # Parse main.rs once; the notification bridge command was just ensured above.
+        commands = codegen.extract_commands(text)
+        names = [c.name for c in commands]
+        if _BRIDGE_COMMAND not in names:
+            names.insert(0, _BRIDGE_COMMAND)
+        seen: set[str] = set()
+        names = [n for n in names if not (n in seen or seen.add(n))]
+
+        text = self._set_command_region(text, names)
+        self._write_if_changed(main_rs, text)
+
+        permission = src_tauri / "permissions" / "reflex-desktop.toml"
+        permission.parent.mkdir(parents=True, exist_ok=True)
+        self._write_if_changed(permission, _commands_permission_toml(names))
+        return commands
+
+    @staticmethod
+    def _set_command_region(text: str, names: list[str]) -> str:
+        """Update the managed command list inside ``generate_handler!`` idempotently.
+
+        If the markers exist, only their body is rewritten (preserving any commands the user
+        added inside the macro but outside the region). Otherwise the whole ``.invoke_handler``
+        call is replaced with the managed form (migrating an older single-line scaffold), or a
+        fresh call is inserted after ``tauri::Builder::default()``.
+
+        Args:
+            text: Current ``main.rs`` contents.
+            names: Command names to register.
+
+        Returns:
+            Updated ``main.rs`` contents.
+        """
+        begin, end = _RS_COMMANDS_REGION
+        if begin in text and end in text:
+            body = "\n".join(f"            {name}," for name in names)
+            head = text[: text.index(begin)]
+            tail = text[text.index(end) + len(end) :]
+            return f"{head}{begin}\n{body}\n{end}{tail}"
+
+        rendered = _render_invoke_handler(names)
+        span = _invoke_handler_span(text)
+        if span:
+            start, stop = span
+            return text[:start] + rendered + text[stop:]
+        return text.replace(
+            "tauri::Builder::default()",
+            f"tauri::Builder::default()\n{rendered}",
+            1,
+        )
+
+    def _write_command_stubs(self, commands: list[codegen.Command]) -> None:
+        """Generate the typed Python bindings module (when ``command_stubs`` is set).
+
+        Args:
+            commands: Commands parsed from ``main.rs`` during this build.
+        """
+        from reflex_base.utils import console
+
+        override = self.command_stubs if isinstance(self.command_stubs, str) else None
+        out = codegen.resolve_output_path(Path.cwd(), override)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        self._write_if_changed(out, codegen.render_module(commands))
+        console.info(f"reflex-desktop: wrote command bindings to {out}")
 
     @staticmethod
     def _replace_notification_bridge_commands(text: str) -> str:
@@ -619,6 +746,22 @@ class DesktopPlugin(Plugin):
                 1,
             )
         return text
+
+    @staticmethod
+    def _write_if_changed(path: Path, content: str) -> None:
+        """Write ``content`` only when it differs from what's on disk.
+
+        The configure step runs on every build; writing identical content anyway would bump
+        the file's mtime, and for ``main.rs``/``Cargo.toml`` that makes cargo recompile the
+        whole crate even when nothing changed.
+
+        Args:
+            path: Destination file.
+            content: The content the file should have.
+        """
+        if path.exists() and path.read_text() == content:
+            return
+        path.write_text(content)
 
     @staticmethod
     def _set_region(text: str, begin: str, end: str, anchor: str, body: str) -> str:

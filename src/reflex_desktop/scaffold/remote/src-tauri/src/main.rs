@@ -92,7 +92,11 @@ fn main() {
     }
 
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![reflex_desktop_notify])
+        .invoke_handler(tauri::generate_handler![
+            // >>> reflex-desktop commands >>>
+            reflex_desktop_notify,
+            // <<< reflex-desktop commands <<<
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
