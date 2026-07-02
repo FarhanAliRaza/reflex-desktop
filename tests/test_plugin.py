@@ -322,3 +322,172 @@ def test_icon_copied_over_bundle_icons(tmp_path, monkeypatch):
     src = _build_remote(tmp_path, monkeypatch, icon="logo.png")
     for name in ("32x32.png", "128x128.png", "128x128@2x.png", "icon.png"):
         assert (src / "icons" / name).read_bytes() == data
+
+
+def test_default_port_is_stable_and_per_identifier():
+    """The embedded default port is derived from the identifier: stable, in range, per-app."""
+    from reflex_desktop.config import PORT_RANGE, default_port
+
+    port = default_port("dev.reflex.appone")
+    assert port == default_port("dev.reflex.appone")
+    assert PORT_RANGE[0] <= port <= PORT_RANGE[1]
+    assert port != default_port("dev.reflex.apptwo")
+
+
+def test_update_env_json_embedded_default_port_derives_from_identifier():
+    """Without an explicit port, env.json bakes the identifier-derived per-app port."""
+    from reflex_desktop.config import default_port
+
+    plugin = DesktopPlugin(backend="embedded", product_name="App", identifier="dev.reflex.counter")
+    env = plugin.update_env_json()
+    assert env is not None
+    port = default_port("dev.reflex.counter")
+    assert env["PING"] == f"http://127.0.0.1:{port}/ping"
+
+
+def test_embedded_scaffold_default_port_substituted(tmp_path, monkeypatch):
+    """The identifier-derived port is substituted into the embedded shell's main.rs."""
+    from reflex_desktop.config import default_port
+
+    static_dir = tmp_path / ".web" / "build" / "client"
+    static_dir.mkdir(parents=True)
+    (static_dir / "index.html").write_text("x")
+    monkeypatch.chdir(tmp_path)
+
+    DesktopPlugin(
+        backend="embedded", product_name="App", identifier="dev.reflex.counter"
+    ).post_build(static_dir=static_dir)
+
+    main_rs = (tmp_path / "tauri" / "src-tauri" / "src" / "main.rs").read_text()
+    assert f"const BACKEND_PORT: u16 = {default_port('dev.reflex.counter')};" in main_rs
+
+
+def test_embedded_scaffold_is_relocatable(tmp_path, monkeypatch):
+    """The embedded shell carries bundle-relative rpaths and the Windows DLL mapping."""
+    static_dir = tmp_path / ".web" / "build" / "client"
+    static_dir.mkdir(parents=True)
+    (static_dir / "index.html").write_text("x")
+    monkeypatch.chdir(tmp_path)
+
+    DesktopPlugin(backend="embedded", product_name="App", identifier="dev.reflex.app").post_build(
+        static_dir=static_dir
+    )
+
+    src_tauri = tmp_path / "tauri" / "src-tauri"
+    build_rs = (src_tauri / "build.rs").read_text()
+    assert "$ORIGIN/../lib/" in build_rs
+    assert "@executable_path/../Resources/python/python/lib" in build_rs
+    conf = json.loads((src_tauri / "tauri.conf.json").read_text())
+    # The Windows DLL mapping is only written when building on Windows (a no-match
+    # resource glob fails tauri-build on other platforms).
+    import sys
+
+    dll_mapped = conf["bundle"]["resources"].get("python/python/python3*.dll") == "./"
+    assert dll_mapped == sys.platform.startswith("win")
+
+
+def test_embedded_scaffold_busy_port_shows_dialog(tmp_path, monkeypatch):
+    """A busy backend port surfaces a native error dialog, not just a stderr line."""
+    static_dir = tmp_path / ".web" / "build" / "client"
+    static_dir.mkdir(parents=True)
+    (static_dir / "index.html").write_text("x")
+    monkeypatch.chdir(tmp_path)
+
+    DesktopPlugin(backend="embedded", product_name="App", identifier="dev.reflex.app").post_build(
+        static_dir=static_dir
+    )
+
+    src_tauri = tmp_path / "tauri" / "src-tauri"
+    assert "tauri-plugin-dialog" in (src_tauri / "Cargo.toml").read_text()
+    main_rs = (src_tauri / "src" / "main.rs").read_text()
+    assert ".plugin(tauri_plugin_dialog::init())" in main_rs
+    assert "blocking_show()" in main_rs
+
+
+def test_scaffold_registered_plugins_not_duplicated(tmp_path, monkeypatch):
+    """Requesting a plugin the scaffold already registers only grants its capability."""
+    static_dir = tmp_path / ".web" / "build" / "client"
+    static_dir.mkdir(parents=True)
+    (static_dir / "index.html").write_text("x")
+    monkeypatch.chdir(tmp_path)
+
+    DesktopPlugin(
+        backend="embedded",
+        product_name="App",
+        identifier="dev.reflex.app",
+        tauri_plugins=("dialog", "single-instance"),
+    ).post_build(static_dir=static_dir)
+
+    src_tauri = tmp_path / "tauri" / "src-tauri"
+    cargo = (src_tauri / "Cargo.toml").read_text()
+    assert cargo.count("tauri-plugin-dialog") == 1
+    assert cargo.count("tauri-plugin-single-instance") == 1
+    main_rs = (src_tauri / "src" / "main.rs").read_text()
+    assert main_rs.count("tauri_plugin_dialog::init()") == 1
+    assert main_rs.count("tauri_plugin_single_instance::init(") == 1
+    perms = json.loads((src_tauri / "capabilities" / "default.json").read_text())["permissions"]
+    assert "dialog:default" in perms
+
+
+def test_tray_injection_and_roundtrip(tmp_path, monkeypatch):
+    """tray=True generates the tray Rust + cargo feature; tray=False removes both again."""
+    src = _build_remote(tmp_path, monkeypatch, tray=True)
+    main_rs = (src / "src" / "main.rs").read_text()
+    assert "tauri::tray::TrayIconBuilder" in main_rs
+    assert '.tooltip("App")' in main_rs
+    assert 'features = ["tray-icon"]' in (src / "Cargo.toml").read_text()
+
+    # Rebuild with the same config: region rewritten, not duplicated.
+    src = _build_remote(tmp_path, monkeypatch, tray=True)
+    assert (src / "src" / "main.rs").read_text().count("TrayIconBuilder") == 1
+    assert (src / "Cargo.toml").read_text().count("tray-icon") == 1
+
+    # Disabling the tray on a later build removes the generated Rust and the feature.
+    src = _build_remote(tmp_path, monkeypatch, tray=False)
+    assert "TrayIconBuilder" not in (src / "src" / "main.rs").read_text()
+    assert "tray-icon" not in (src / "Cargo.toml").read_text()
+
+
+def test_tray_tooltip_override(tmp_path, monkeypatch):
+    """A custom tray tooltip lands in the generated Rust."""
+    src = _build_remote(tmp_path, monkeypatch, tray=True, tray_tooltip="My Tray")
+    assert '.tooltip("My Tray")' in (src / "src" / "main.rs").read_text()
+
+
+def test_embedded_scaffold_has_setup_region_for_tray(tmp_path, monkeypatch):
+    """The embedded shell's setup closure also accepts the generated tray code."""
+    static_dir = tmp_path / ".web" / "build" / "client"
+    static_dir.mkdir(parents=True)
+    (static_dir / "index.html").write_text("x")
+    monkeypatch.chdir(tmp_path)
+
+    DesktopPlugin(
+        backend="embedded", product_name="App", identifier="dev.reflex.app", tray=True
+    ).post_build(static_dir=static_dir)
+
+    main_rs = (tmp_path / "tauri" / "src-tauri" / "src" / "main.rs").read_text()
+    assert "tauri::tray::TrayIconBuilder" in main_rs
+    # The tray code lives inside the setup region, before the backend spawn.
+    assert main_rs.index("TrayIconBuilder") < main_rs.index("spawn_backend(app_root);")
+
+
+def test_updater_plugin_config_and_registration(tmp_path, monkeypatch):
+    """The updater plugin gets its non-init() registration, conf block, and capability."""
+    src = _build_remote(
+        tmp_path,
+        monkeypatch,
+        tauri_plugins=("updater",),
+        updater_endpoints=("https://releases.example.com/{{target}}/{{current_version}}",),
+        updater_pubkey="PUBKEY",
+    )
+    conf = json.loads((src / "tauri.conf.json").read_text())
+    assert conf["plugins"]["updater"]["endpoints"] == [
+        "https://releases.example.com/{{target}}/{{current_version}}"
+    ]
+    assert conf["plugins"]["updater"]["pubkey"] == "PUBKEY"
+    assert conf["bundle"]["createUpdaterArtifacts"] is True
+    main_rs = (src / "src" / "main.rs").read_text()
+    assert ".plugin(tauri_plugin_updater::Builder::new().build())" in main_rs
+    assert "tauri_plugin_updater::init()" not in main_rs
+    perms = json.loads((src / "capabilities" / "default.json").read_text())["permissions"]
+    assert "updater:default" in perms

@@ -168,3 +168,104 @@ def test_no_cors_warning_for_remote(monkeypatch):
     warnings = _capture_warnings(monkeypatch)
     DesktopPlugin(backend="remote", backend_url="https://example.com")._warn_if_cors_blocks()
     assert not warnings
+
+
+def test_default_requirements_pin_local_versions(monkeypatch):
+    """The embedded backend pins reflex/uvicorn to the versions in the build env."""
+    versions = {"reflex": "0.9.5", "uvicorn": "0.30.1"}
+    monkeypatch.setattr(runtime.importlib.metadata, "version", lambda name: versions[name])
+    assert runtime.default_requirements() == ["reflex==0.9.5", "uvicorn[standard]==0.30.1"]
+
+
+def test_default_requirements_fall_back_unpinned(monkeypatch):
+    """A package missing from the build env falls back to an unpinned specifier."""
+
+    def missing(name):
+        raise runtime.importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(runtime.importlib.metadata, "version", missing)
+    assert runtime.default_requirements() == ["reflex", "uvicorn[standard]"]
+
+
+def test_assemble_installs_pinned_requirements(monkeypatch, tmp_path):
+    """assemble() installs the pinned requirement set, not a floating one."""
+    installs = _stub_assemble(monkeypatch, tmp_path)
+    versions = {"reflex": "0.9.5", "uvicorn": "0.30.1"}
+    monkeypatch.setattr(runtime.importlib.metadata, "version", lambda name: versions[name])
+    src_tauri = tmp_path / "tauri" / "src-tauri"
+    src_tauri.mkdir(parents=True)
+
+    runtime.assemble(src_tauri, tmp_path)
+    assert installs[0][:2] == ["reflex==0.9.5", "uvicorn[standard]==0.30.1"]
+
+
+def test_trim_runtime_prunes_unused_stdlib(tmp_path):
+    """trim_runtime drops the stdlib test/tkinter/idle trees and Tcl/Tk, keeps the rest."""
+    python_dir = tmp_path / "python"
+    stdlib = python_dir / "python" / "lib" / "python3.12"
+    for name in ("test", "idlelib", "tkinter", "turtledemo", "asyncio", "encodings"):
+        (stdlib / name).mkdir(parents=True)
+    (python_dir / "python" / "lib" / "tcl8.6").mkdir(parents=True)
+    (python_dir / "python" / "lib" / "tk8.6").mkdir(parents=True)
+
+    runtime.trim_runtime(python_dir)
+
+    for name in ("test", "idlelib", "tkinter", "turtledemo"):
+        assert not (stdlib / name).exists()
+    assert (stdlib / "asyncio").exists()
+    assert (stdlib / "encodings").exists()
+    assert not (python_dir / "python" / "lib" / "tcl8.6").exists()
+    assert not (python_dir / "python" / "lib" / "tk8.6").exists()
+
+
+def test_trim_runtime_windows_layout(tmp_path):
+    """trim_runtime handles the Windows tree (Lib/ stdlib, top-level tcl/)."""
+    python_dir = tmp_path / "python"
+    stdlib = python_dir / "python" / "Lib"
+    for name in ("test", "idlelib", "json"):
+        (stdlib / name).mkdir(parents=True)
+    (python_dir / "python" / "tcl").mkdir(parents=True)
+
+    runtime.trim_runtime(python_dir)
+
+    assert not (stdlib / "test").exists()
+    assert not (stdlib / "idlelib").exists()
+    assert (stdlib / "json").exists()
+    assert not (python_dir / "python" / "tcl").exists()
+
+
+def test_trim_site_packages(tmp_path):
+    """trim_site_packages strips bytecode caches and script shims, keeps packages."""
+    site = tmp_path / "site-packages"
+    (site / "reflex" / "__pycache__").mkdir(parents=True)
+    (site / "reflex" / "__pycache__" / "app.cpython-312.pyc").write_bytes(b"")
+    (site / "reflex" / "app.py").write_text("x = 1\n")
+    (site / "bin").mkdir()
+    (site / "bin" / "uvicorn").write_text("#!/build/machine/python\n")
+    (site / "Scripts").mkdir()
+
+    runtime.trim_site_packages(site)
+
+    assert not list(site.rglob("__pycache__"))
+    assert not (site / "bin").exists()
+    assert not (site / "Scripts").exists()
+    assert (site / "reflex" / "app.py").exists()
+
+
+def test_rewrite_macos_libpython_id_targets_rpath(monkeypatch, tmp_path):
+    """The bundled libpython's install name is rewritten to @rpath and re-signed."""
+    lib = tmp_path / "python" / "lib"
+    lib.mkdir(parents=True)
+    dylib = lib / "libpython3.12.dylib"
+    dylib.write_bytes(b"\xcf\xfa\xed\xfe")
+
+    calls = []
+    monkeypatch.setattr(runtime.subprocess, "run", lambda cmd, check: calls.append(cmd))
+    monkeypatch.setattr(runtime.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    runtime._rewrite_macos_libpython_id(tmp_path)
+
+    assert calls[0][:2] == ["install_name_tool", "-id"]
+    assert calls[0][2] == "@rpath/libpython3.12.dylib"
+    assert calls[0][3] == str(dylib)
+    assert calls[1][0] == "codesign"

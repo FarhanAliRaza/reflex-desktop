@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Sync dependencies
+        run: uv sync --dev
+      - name: Lint
+        run: uv run ruff check .
+      - name: Run tests
+        run: uv run pytest -q
+
+  # Builds the example app's desktop binary end-to-end: reflex export (scaffolds the
+  # Tauri shell via DesktopPlugin), embedded runtime assembly (downloads
+  # python-build-standalone + pip-installs the pinned backend), and the cargo compile.
+  # This is the only place the Rust scaffolds are compiled on all three platforms.
+  build-desktop:
+    name: build example (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev xvfb
+      - name: Sync example dependencies
+        working-directory: example
+        run: uv sync
+      - name: Export frontend + scaffold Tauri shell
+        working-directory: example
+        run: uv run reflex export --frontend-only
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: example/tauri/src-tauri
+      - name: Build desktop binary (embedded backend)
+        working-directory: example
+        run: uv run reflex-desktop build --debug --skip-export
+      - name: Install Tauri CLI
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli
+      - name: Bundle a .deb and verify the installed app relocates (Linux)
+        if: runner.os == 'Linux'
+        working-directory: example
+        run: |
+          export PYO3_PYTHON="$PWD/tauri/src-tauri/python/python/bin/python3"
+          (cd tauri/src-tauri && cargo tauri build --debug --bundles deb)
+          sudo dpkg -i tauri/src-tauri/target/debug/bundle/deb/*.deb
+          # The acid test for relocatability: the installed binary (at /usr/bin, far
+          # from the build tree) must resolve the bundled libpython and boot the
+          # embedded backend on the baked-in port. The baked env.json is bundled into
+          # the compiled JS (not shipped as a file), so read the port from the
+          # generated shell source instead.
+          PORT=$(sed -nE 's/.*BACKEND_PORT: u16 = ([0-9]+);.*/\1/p' tauri/src-tauri/src/main.rs)
+          PING="http://127.0.0.1:$PORT/ping"
+          echo "polling $PING"
+          # The binary also carries the build tree's absolute rpath (for dev runs).
+          # Move the build-tree runtime away so the installed app can only resolve
+          # libpython through the $ORIGIN-relative rpath — otherwise this test would
+          # pass on the build machine without proving relocation.
+          mv tauri/src-tauri/python tauri/src-tauri/python.hidden
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1
+          xvfb-run -a reflex-counter &
+          APP_PID=$!
+          ok=""
+          for _ in $(seq 1 45); do
+            if curl -sf "$PING" > /dev/null; then ok=1; break; fi
+            sleep 2
+          done
+          kill "$APP_PID" 2>/dev/null || true
+          if [ -z "$ok" ]; then
+            echo "installed app's embedded backend never answered on $PING" >&2
+            exit 1
+          fi
+          echo "embedded backend answered from the installed bundle."

@@ -82,3 +82,35 @@ def test_desnap_env_noop_without_snap(monkeypatch):
     env = cli._desnap_env()
     assert "LD_LIBRARY_PATH" not in env
     assert "LD_PRELOAD" not in env
+
+
+def test_wait_for_port_aborts_when_dev_server_dies():
+    """_wait_for_port raises instead of spinning when `reflex run` exits early."""
+    import click
+    import pytest
+
+    class Dead:
+        returncode = 3
+
+        def poll(self):
+            return 3
+
+    with pytest.raises(click.ClickException, match="exited with code 3"):
+        cli._wait_for_port(65500, Dead(), timeout=5)
+
+
+def test_wait_for_port_returns_once_listening():
+    """_wait_for_port returns as soon as the dev server port accepts connections."""
+    import socket
+
+    class Alive:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        cli._wait_for_port(port, Alive(), timeout=10)

@@ -6,12 +6,13 @@ import dataclasses
 import json
 import re
 import shutil
+import sys
 from pathlib import Path
 from typing import Literal
 
 from reflex.plugins import Plugin
 
-from .config import DEFAULT_PORT, DEFAULT_TAURI_DIR, LOOPBACK_HOST, slugify
+from .config import DEFAULT_TAURI_DIR, LOOPBACK_HOST, default_port, slugify
 
 BackendMode = Literal["remote", "embedded"]
 
@@ -24,6 +25,46 @@ _BACKEND_MARKER = ".reflex-desktop-backend"
 # Managed-region markers for idempotent injection of extra Tauri plugins.
 _CARGO_REGION = ("# >>> reflex-desktop plugins >>>", "# <<< reflex-desktop plugins <<<")
 _RS_REGION = ("    // >>> reflex-desktop plugins >>>", "    // <<< reflex-desktop plugins <<<")
+# Managed region inside the Builder's setup closure for generated startup Rust (tray, ...).
+_SETUP_REGION = (
+    "            // >>> reflex-desktop setup >>>",
+    "            // <<< reflex-desktop setup <<<",
+)
+# The scaffold's tauri dependency line, with and without the tray feature.
+_TAURI_DEP_PLAIN = 'tauri = { version = "2" }'
+_TAURI_DEP_TRAY = 'tauri = { version = "2", features = ["tray-icon"] }'
+_TRAY_RS_TEMPLATE = """\
+            {
+                use tauri::Manager as _;
+                let tray_menu = tauri::menu::MenuBuilder::new(app)
+                    .item(
+                        &tauri::menu::MenuItemBuilder::with_id("reflex-desktop-show", "Show")
+                            .build(app)?,
+                    )
+                    .item(
+                        &tauri::menu::MenuItemBuilder::with_id("reflex-desktop-quit", "Quit")
+                            .build(app)?,
+                    )
+                    .build()?;
+                let mut tray = tauri::tray::TrayIconBuilder::with_id("reflex-desktop-tray")
+                    .menu(&tray_menu)
+                    .tooltip(__TOOLTIP__)
+                    .on_menu_event(|app, event| match event.id().as_ref() {
+                        "reflex-desktop-show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "reflex-desktop-quit" => app.exit(0),
+                        _ => {}
+                    });
+                if let Some(icon) = app.default_window_icon() {
+                    tray = tray.icon(icon.clone());
+                }
+                tray.build(app)?;
+            }"""
 _NOTIFICATION_BRIDGE_DEP = 'notify-rust = "4"'
 _NOTIFICATION_BRIDGE_HANDLER = (
     "        .invoke_handler(tauri::generate_handler![reflex_desktop_notify])"
@@ -137,7 +178,9 @@ class DesktopPlugin(Plugin):
             URL; ``"embedded"`` runs the ASGI backend in-process on ``127.0.0.1:port``.
         backend_url: Base URL of the remote backend (``remote`` mode). When ``None`` the
             app's ``config.api_url`` is used unchanged.
-        port: Loopback port the embedded backend binds to (``embedded`` mode).
+        port: Loopback port the embedded backend binds to (``embedded`` mode). Defaults to
+            a stable per-app port derived from the bundle identifier, so two installed
+            reflex-desktop apps don't collide on a shared fixed port.
         product_name: Display name of the app. Defaults to the Reflex app name.
         identifier: Reverse-DNS bundle identifier. Defaults to ``dev.reflex.<app>``.
         window_title: Title of the main window. Defaults to ``product_name``.
@@ -160,10 +203,19 @@ class DesktopPlugin(Plugin):
         with_global_tauri: Expose ``window.__TAURI__`` in the webview so Reflex event handlers
             can call native APIs (e.g. ``reflex_desktop.desktop.minimize()`` via
             ``rx.call_script``).
+        tray: Add a system tray icon (the app icon) with a Show / Quit menu. On Linux the
+            tray needs libayatana-appindicator at runtime (see ``reflex-desktop doctor``).
+        tray_tooltip: Tray icon tooltip. Defaults to ``product_name``.
         tauri_plugins: Extra Tauri plugins to add (crate ``tauri-plugin-<name>``), injected into
             ``Cargo.toml``/``main.rs`` and granted ``<name>:default`` permission, e.g.
-            ``("notification", "dialog")``. Plugins whose Rust init isn't ``init()`` need a manual
-            edit to ``main.rs``.
+            ``("notification", "dialog")``. Plugins the scaffold already registers are only
+            granted their permission. Plugins whose Rust init isn't ``init()`` (and isn't
+            special-cased, like ``updater``) need a manual edit to ``main.rs``.
+        updater_endpoints: Update-manifest URLs for ``tauri-plugin-updater`` (written to
+            ``tauri.conf.json`` and enabling updater artifacts). Requires
+            ``"updater"`` in ``tauri_plugins``; see docs/updater.md.
+        updater_pubkey: The minisign public key updates must be signed with (from
+            ``cargo tauri signer generate``). Required by the updater plugin.
         extra_capabilities: Additional capability permission strings to grant the main window.
         tauri_dir: Tauri project directory relative to the app root (holds ``src-tauri/``
             and the copied static frontend in ``dist/``).
@@ -171,7 +223,7 @@ class DesktopPlugin(Plugin):
 
     backend: BackendMode = "remote"
     backend_url: str | None = None
-    port: int = DEFAULT_PORT
+    port: int | None = None
     product_name: str | None = None
     identifier: str | None = None
     window_title: str | None = None
@@ -191,9 +243,23 @@ class DesktopPlugin(Plugin):
     theme: str | None = None
     icon: str | None = None
     with_global_tauri: bool = True
+    tray: bool = False
+    tray_tooltip: str | None = None
     tauri_plugins: tuple[str, ...] = ()
+    updater_endpoints: tuple[str, ...] = ()
+    updater_pubkey: str | None = None
     extra_capabilities: tuple[str, ...] = ()
     tauri_dir: str = DEFAULT_TAURI_DIR
+
+    def _resolved_port(self) -> int:
+        """Return the embedded backend port, deriving the per-app default when unset.
+
+        Returns:
+            The explicitly configured port, or a stable port hashed from the identifier.
+        """
+        if self.port is not None:
+            return self.port
+        return default_port(self._resolved_names()[1])
 
     def _backend_base(self) -> str | None:
         """Return the backend base URL to bake into ``env.json``.
@@ -202,7 +268,7 @@ class DesktopPlugin(Plugin):
             The base URL (no trailing slash), or ``None`` to leave ``config.api_url`` as-is.
         """
         if self.backend == "embedded":
-            return f"http://{LOOPBACK_HOST}:{self.port}"
+            return f"http://{LOOPBACK_HOST}:{self._resolved_port()}"
         return self.backend_url.rstrip("/") if self.backend_url else None
 
     def update_env_json(self, **context) -> dict[str, str] | None:
@@ -357,6 +423,7 @@ class DesktopPlugin(Plugin):
         self._apply_capabilities(src_tauri / "capabilities" / "default.json")
         self._apply_plugins(src_tauri)
         self._apply_notification_bridge(src_tauri)
+        self._apply_tray(src_tauri, product_name)
 
     def _write_gitignore(self, project_root: Path) -> None:
         """Write a ``.gitignore`` for the generated Tauri build artifacts.
@@ -429,6 +496,24 @@ class DesktopPlugin(Plugin):
         for key, value in optional.items():
             if value is not None:
                 window[key] = value
+        if self.backend == "embedded":
+            # Windows resolves the exe's load-time python3XY.dll import from the exe's own
+            # directory, so map the bundled DLLs next to it. Managed per-platform because
+            # tauri-build fails the build on a resource glob with no matches.
+            resources = conf.setdefault("bundle", {}).setdefault("resources", {})
+            dll_glob = "python/python/python3*.dll"
+            if sys.platform in ("win32", "cygwin"):
+                resources[dll_glob] = "./"
+            else:
+                resources.pop(dll_glob, None)
+        if "updater" in self.tauri_plugins:
+            updater = conf.setdefault("plugins", {}).setdefault("updater", {})
+            if self.updater_endpoints:
+                updater["endpoints"] = list(self.updater_endpoints)
+            if self.updater_pubkey:
+                updater["pubkey"] = self.updater_pubkey
+            # cargo tauri build then emits the signed artifacts the updater consumes.
+            conf.setdefault("bundle", {})["createUpdaterArtifacts"] = True
         conf_path.write_text(json.dumps(conf, indent=2) + "\n")
 
     def _apply_icon(self, src_tauri: Path) -> None:
@@ -498,38 +583,135 @@ class DesktopPlugin(Plugin):
         cap_path.parent.mkdir(parents=True, exist_ok=True)
         cap_path.write_text(json.dumps(cap, indent=2) + "\n")
 
+    # Plugins whose Rust registration is not the conventional ``init()``.
+    _PLUGIN_INIT_OVERRIDES = {
+        "updater": "tauri_plugin_updater::Builder::new().build()",
+    }
+
     def _apply_plugins(self, src_tauri: Path) -> None:
         """Inject the configured extra Tauri plugins into ``Cargo.toml`` and ``main.rs``.
 
         Writes a managed region (between marker comments) in each file so the set is rewritten
-        idempotently on every build and edits outside the region are preserved.
+        idempotently on every build and edits outside the region are preserved. Plugins the
+        scaffold (or a hand edit) already wires up outside the region — e.g. ``dialog`` and
+        ``single-instance`` in the embedded shell — are skipped, so requesting them in
+        ``tauri_plugins`` only grants their capability instead of double-registering.
 
         Args:
             src_tauri: The ``src-tauri`` directory.
         """
-        deps = "\n".join(f'tauri-plugin-{name} = "2"' for name in self.tauri_plugins)
-        registrations = "\n".join(
-            f"        .plugin(tauri_plugin_{name.replace('-', '_')}::init())"
-            for name in self.tauri_plugins
-        )
         cargo = src_tauri / "Cargo.toml"
-        if cargo.exists():
-            cargo.write_text(
-                self._set_region(
-                    cargo.read_text(), _CARGO_REGION[0], _CARGO_REGION[1], "[dependencies]", deps
-                )
-            )
         main_rs = src_tauri / "src" / "main.rs"
+
+        if cargo.exists():
+            text = cargo.read_text()
+            baseline = self._without_region(text, _CARGO_REGION[0], _CARGO_REGION[1])
+            deps = "\n".join(
+                f'tauri-plugin-{name} = "2"'
+                for name in self.tauri_plugins
+                if not re.search(rf"(?m)^tauri-plugin-{re.escape(name)}\s*=", baseline)
+            )
+            cargo.write_text(
+                self._set_region(text, _CARGO_REGION[0], _CARGO_REGION[1], "[dependencies]", deps)
+            )
+
         if main_rs.exists():
+            text = main_rs.read_text()
+            baseline = self._without_region(text, _RS_REGION[0], _RS_REGION[1])
+            registrations = "\n".join(
+                f"        .plugin({self._plugin_init(name)})"
+                for name in self.tauri_plugins
+                if f"tauri_plugin_{name.replace('-', '_')}::" not in baseline
+            )
             main_rs.write_text(
                 self._set_region(
-                    main_rs.read_text(),
+                    text,
                     _RS_REGION[0],
                     _RS_REGION[1],
                     "tauri::Builder::default()",
                     registrations,
                 )
             )
+
+    def _apply_tray(self, src_tauri: Path, product_name: str) -> None:
+        """Write the generated tray-icon Rust into the managed setup region (idempotent).
+
+        With ``tray=False`` the region is emptied and the ``tray-icon`` cargo feature is
+        dropped again, so toggling the option round-trips cleanly.
+
+        Args:
+            src_tauri: The ``src-tauri`` directory.
+            product_name: Resolved product name (default tooltip).
+        """
+        main_rs = src_tauri / "src" / "main.rs"
+        if not main_rs.exists():
+            return
+        tooltip = json.dumps(self.tray_tooltip or product_name, ensure_ascii=False)
+        body = _TRAY_RS_TEMPLATE.replace("__TOOLTIP__", tooltip) if self.tray else ""
+        text = main_rs.read_text()
+        if _SETUP_REGION[0] not in text and ".setup(" not in text:
+            # Scaffold predating the setup hook: add one ahead of the run() call.
+            text = text.replace(
+                "        .run(tauri::generate_context!())",
+                "        .setup(|app| {\n"
+                f"{_SETUP_REGION[0]}\n{_SETUP_REGION[1]}\n"
+                "            let _ = app;\n"
+                "            Ok(())\n"
+                "        })\n"
+                "        .run(tauri::generate_context!())",
+                1,
+            )
+        main_rs.write_text(
+            self._set_region(text, _SETUP_REGION[0], _SETUP_REGION[1], ".setup(|app| {", body)
+        )
+
+        cargo = src_tauri / "Cargo.toml"
+        if not cargo.exists():
+            return
+        cargo_text = cargo.read_text()
+        if self.tray:
+            updated = cargo_text.replace(_TAURI_DEP_PLAIN, _TAURI_DEP_TRAY, 1)
+            if "tray-icon" not in updated:
+                from reflex_base.utils import console
+
+                console.warn(
+                    "reflex-desktop: could not enable the `tray-icon` cargo feature "
+                    "automatically (custom tauri dependency line in Cargo.toml?); add "
+                    '`features = ["tray-icon"]` to the tauri dependency by hand.'
+                )
+            cargo_text = updated
+        else:
+            cargo_text = cargo_text.replace(_TAURI_DEP_TRAY, _TAURI_DEP_PLAIN, 1)
+        cargo.write_text(cargo_text)
+
+    @classmethod
+    def _plugin_init(cls, name: str) -> str:
+        """Return the Rust expression that registers a Tauri plugin.
+
+        Args:
+            name: The plugin's crate suffix (e.g. ``"dialog"`` for ``tauri-plugin-dialog``).
+
+        Returns:
+            The registration expression to pass to ``.plugin(...)``.
+        """
+        snake = name.replace("-", "_")
+        return cls._PLUGIN_INIT_OVERRIDES.get(name, f"tauri_plugin_{snake}::init()")
+
+    @staticmethod
+    def _without_region(text: str, begin: str, end: str) -> str:
+        """Return ``text`` with the managed region (markers included) removed.
+
+        Args:
+            text: The file contents.
+            begin: Region begin marker line.
+            end: Region end marker line.
+
+        Returns:
+            The contents outside the managed region.
+        """
+        if begin in text and end in text:
+            return text[: text.index(begin)] + text[text.index(end) + len(end) :]
+        return text
 
     def _apply_notification_bridge(self, src_tauri: Path) -> None:
         """Ensure reused scaffolds include the Reflex notification command.
@@ -653,5 +835,5 @@ class DesktopPlugin(Plugin):
                 continue
             text = path.read_text()
             text = text.replace(_CRATE_NAME_TOKEN, crate_name)
-            text = text.replace(_PORT_TOKEN, str(self.port))
+            text = text.replace(_PORT_TOKEN, str(self._resolved_port()))
             path.write_text(text)

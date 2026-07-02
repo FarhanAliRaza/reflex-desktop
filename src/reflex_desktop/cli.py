@@ -7,6 +7,7 @@ frontend), then compiles the Tauri shell with ``cargo``.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -98,6 +99,19 @@ def _desnap_env() -> dict[str, str]:
     return env
 
 
+def _reflex_cmd() -> list[str]:
+    """Resolve the ``reflex`` command to invoke for subprocesses.
+
+    Returns:
+        The command prefix (executable, or ``python -m reflex`` fallback).
+    """
+    # Prefer the reflex executable from the same venv as the running interpreter, so the
+    # build uses the env reflex-desktop is installed in regardless of PATH / the cwd's project.
+    sibling = Path(sys.executable).parent / ("reflex.exe" if os.name == "nt" else "reflex")
+    reflex_bin = str(sibling) if sibling.exists() else shutil.which("reflex")
+    return [reflex_bin] if reflex_bin else [sys.executable, "-m", "reflex"]
+
+
 def _reflex_export(app_root: Path) -> None:
     """Build the static frontend via ``reflex export --frontend-only``.
 
@@ -107,12 +121,7 @@ def _reflex_export(app_root: Path) -> None:
     Raises:
         ClickException: If the ``reflex`` executable cannot be located.
     """
-    # Prefer the reflex executable from the same venv as the running interpreter, so the
-    # build uses the env reflex-desktop is installed in regardless of PATH / the cwd's project.
-    sibling = Path(sys.executable).parent / ("reflex.exe" if os.name == "nt" else "reflex")
-    reflex_bin = str(sibling) if sibling.exists() else shutil.which("reflex")
-    cmd = [reflex_bin] if reflex_bin else [sys.executable, "-m", "reflex"]
-    _run([*cmd, "export", "--frontend-only"], cwd=app_root)
+    _run([*_reflex_cmd(), "export", "--frontend-only"], cwd=app_root)
 
 
 def _crate_name(src_tauri: Path) -> str | None:
@@ -302,13 +311,6 @@ def _build_app(app_dir: str, release: bool, bundle: bool, skip_export: bool):
         env = {**os.environ, "PYO3_PYTHON": str(interpreter)}
 
     if bundle:
-        if plugin is not None and plugin.backend == "embedded":
-            click.echo(
-                "reflex-desktop: note — bundling an embedded app is experimental; the bundled "
-                "interpreter's libpython is found via an absolute rpath, so a relocated/installed "
-                "bundle may fail to launch until the $ORIGIN-relative rpath work (M2) lands.",
-                err=True,
-            )
         cmd = ["cargo", "tauri", "build"] + ([] if release else ["--debug"])
     else:
         cmd = ["cargo", "build"] + (["--release"] if release else [])
@@ -394,20 +396,113 @@ def run(app_dir: str, release: bool, skip_export: bool, skip_build: bool) -> Non
         # only resolves inside a real bundle), so point it at the assembled crate dir holding
         # python/, site-packages/ and app/.
         launch_env["REFLEX_DESKTOP_RESOURCE_DIR"] = str(src_tauri)
+        if os.name == "nt":
+            # Windows resolves the load-time python3XY.dll import from the exe dir or PATH;
+            # a dev binary in target/ has neither, so put the bundled interpreter dir first.
+            dll_dir = str(src_tauri / "python" / "python")
+            launch_env["PATH"] = dll_dir + os.pathsep + launch_env.get("PATH", "")
 
     _install_desktop_entry(plugin, src_tauri, binary)
     click.echo(f"reflex-desktop: launching {binary}")
     _run([str(binary)], cwd=src_tauri.parent.parent, env=launch_env)
 
 
-@main.command()
-def dev() -> None:
-    """Run the app in dev mode (not implemented in v1).
+def _wait_for_port(port: int, process: subprocess.Popen, timeout: float = 600.0) -> None:
+    """Block until ``127.0.0.1:port`` accepts connections (the dev server is up).
+
+    Args:
+        port: The port to poll.
+        process: The dev-server process; its early exit aborts the wait.
+        timeout: Give up after this many seconds.
 
     Raises:
-        ClickException: Always; dev/HMR mode is deferred past v1.
+        ClickException: If the process exits or the port never opens in time.
     """
-    raise click.ClickException("`reflex-desktop dev` is not implemented yet (v1 is build-only).")
+    import socket
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise click.ClickException(
+                f"`reflex run` exited with code {process.returncode} before the dev server "
+                "came up."
+            )
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                return
+        except OSError:
+            time.sleep(0.5)
+    raise click.ClickException(f"timed out waiting for the reflex dev server on port {port}.")
+
+
+@main.command()
+@click.option("--app-dir", default=".", help="App root containing rxconfig.py.")
+def dev(app_dir: str) -> None:
+    """Develop with hot reload inside the real desktop webview.
+
+    Starts the normal ``reflex run`` dev server (backend + hot-reloading frontend), then
+    opens a Tauri dev shell pointed at it — so ``window.__TAURI__`` bridge features
+    (window controls, notifications, invoke, dialogs) work while you iterate, without the
+    full static-export build loop. The dev shell is a plain webview scaffolded into
+    ``<tauri_dir>-dev`` (the embedded backend is not used in dev; the dev server is the
+    backend).
+
+    Args:
+        app_dir: App root containing rxconfig.py.
+
+    Raises:
+        ClickException: If no DesktopPlugin is configured or a build step fails.
+    """
+    import dataclasses
+
+    app_root = Path(app_dir).resolve()
+    os.chdir(app_root)
+    # cargo tauri dev needs the Tauri CLI, same as --bundle.
+    _preflight(bundle=True)
+    plugin = _find_plugin(app_root)
+    if plugin is None:
+        raise click.ClickException(
+            "no DesktopPlugin found in rxconfig.py plugins; add one to use reflex-desktop."
+        )
+
+    # The dev shell is always a remote-style (plain webview) scaffold: in dev the backend
+    # is the `reflex run` dev server, never the embedded interpreter. Kept in its own
+    # directory so it can't clobber the production scaffold.
+    dev_plugin = dataclasses.replace(
+        plugin, backend="remote", backend_url=None, tauri_dir=f"{plugin.tauri_dir}-dev"
+    )
+    src_tauri = app_root / dev_plugin.tauri_dir / "src-tauri"
+    if not src_tauri.exists():
+        dev_plugin._scaffold(src_tauri)
+        click.echo(f"reflex-desktop: scaffolded dev shell at {src_tauri.parent}")
+    dev_plugin._configure(src_tauri)
+    # devUrl replaces the static dist in dev, but keep the configured path present.
+    (src_tauri.parent / "dist").mkdir(parents=True, exist_ok=True)
+
+    from reflex_base.config import get_config
+
+    frontend_port = int(get_config().frontend_port)
+    dev_url = f"http://localhost:{frontend_port}"
+
+    click.echo(f"reflex-desktop: starting `reflex run` (dev server on {dev_url})...")
+    reflex_proc = subprocess.Popen([*_reflex_cmd(), "run"], cwd=app_root)
+    try:
+        _wait_for_port(frontend_port, reflex_proc)
+        click.echo("reflex-desktop: dev server is up; launching the Tauri dev shell.")
+        config_override = json.dumps({"build": {"devUrl": dev_url}})
+        _run(
+            ["cargo", "tauri", "dev", "--config", config_override],
+            cwd=src_tauri,
+            env=_desnap_env(),
+        )
+    finally:
+        if reflex_proc.poll() is None:
+            reflex_proc.terminate()
+            try:
+                reflex_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                reflex_proc.kill()
 
 
 if __name__ == "__main__":

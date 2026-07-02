@@ -13,6 +13,7 @@ points ``PYTHONHOME``/``PYTHONPATH`` at ``python/`` and ``site-packages/`` at ru
 
 from __future__ import annotations
 
+import importlib.metadata
 import platform
 import shutil
 import subprocess
@@ -24,6 +25,30 @@ from pathlib import Path
 # A pinned python-build-standalone release. Override via assemble(release_tag=...).
 DEFAULT_RELEASE_TAG = "20260623"
 DEFAULT_PYTHON_VERSION = "3.12.13"
+
+# Stdlib directories never needed by a headless embedded backend (nor by the pip run that
+# assembles it), pruned from the bundled runtime to cut installer size.
+_STDLIB_PRUNE = ("test", "idlelib", "tkinter", "turtledemo")
+
+
+def default_requirements() -> list[str]:
+    """Return the base pip specifiers for the embedded backend, pinned to the build env.
+
+    The static frontend is compiled by the reflex version installed in the developer's
+    environment; the embedded backend must run the *same* version or the baked frontend
+    and the backend protocol can drift (installing whatever PyPI serves on build day).
+    Each specifier is pinned to the locally installed version when one can be resolved.
+
+    Returns:
+        Pip requirement specifiers for reflex and uvicorn.
+    """
+    requirements = []
+    for package, spec in (("reflex", "reflex"), ("uvicorn", "uvicorn[standard]")):
+        try:
+            requirements.append(f"{spec}=={importlib.metadata.version(package)}")
+        except importlib.metadata.PackageNotFoundError:
+            requirements.append(spec)
+    return requirements
 
 
 def host_triple() -> str:
@@ -108,7 +133,89 @@ def fetch_runtime(python_dir: Path, python_version: str, release_tag: str) -> Pa
     with tarfile.open(archive) as tf:
         tf.extractall(python_dir)  # noqa: S202 - trusted release archive
     archive.unlink()
+    trim_runtime(python_dir)
+    if sys.platform == "darwin":
+        _rewrite_macos_libpython_id(python_dir)
     return interpreter
+
+
+def _stdlib_dir(python_dir: Path) -> Path | None:
+    """Locate the bundled stdlib directory (``lib/pythonX.Y`` or ``Lib`` on Windows).
+
+    Args:
+        python_dir: The ``python/`` directory containing the extracted tree.
+
+    Returns:
+        The stdlib directory, or ``None`` if the layout is unrecognized.
+    """
+    root = python_dir / "python"
+    if not root.is_dir():
+        return None
+    # Match directory names exactly (via iterdir) rather than probing paths: on a
+    # case-insensitive filesystem (macOS, Windows) a probe for the Windows-layout "Lib"
+    # would match a unix-layout "lib" and return the wrong level.
+    entries = {entry.name: entry for entry in root.iterdir() if entry.is_dir()}
+    if "Lib" in entries:
+        return entries["Lib"]
+    lib = entries.get("lib")
+    if lib is not None:
+        for entry in sorted(lib.iterdir()):
+            if entry.is_dir() and entry.name.startswith("python"):
+                return entry
+    return None
+
+
+def trim_runtime(python_dir: Path) -> None:
+    """Prune runtime pieces a headless embedded backend never uses (idempotent).
+
+    Drops the stdlib test suite, IDLE, and tkinter/turtledemo plus the Tcl/Tk support
+    trees — together well over 100 MB uncompressed — while keeping pip (still needed to
+    assemble ``site-packages``).
+
+    Args:
+        python_dir: The ``python/`` directory containing the extracted tree.
+    """
+    stdlib = _stdlib_dir(python_dir)
+    if stdlib is not None:
+        for name in _STDLIB_PRUNE:
+            shutil.rmtree(stdlib / name, ignore_errors=True)
+
+    root = python_dir / "python"
+    # Tcl/Tk data trees: lib/tcl8.6, lib/tk8.6, lib/itcl* on unix; tcl/ on Windows.
+    lib = root / "lib"
+    if lib.is_dir():
+        for entry in lib.iterdir():
+            if entry.is_dir() and entry.name.startswith(("tcl", "tk", "itcl", "thread")):
+                shutil.rmtree(entry, ignore_errors=True)
+    shutil.rmtree(root / "tcl", ignore_errors=True)
+    shutil.rmtree(root / "share", ignore_errors=True)
+
+
+def _rewrite_macos_libpython_id(python_dir: Path) -> None:
+    """Give the bundled libpython an ``@rpath`` install name (macOS relocatability).
+
+    PyO3 links the shell against this dylib, and the load command recorded in the app
+    binary is whatever install name the dylib carries at link time. An absolute or
+    ``@executable_path``-relative name only resolves on the build machine / next to the
+    interpreter, so rewrite it to ``@rpath/libpythonX.Y.dylib`` — the shell's build script
+    then supplies rpath entries for both the dev layout and the installed ``.app`` bundle.
+    The dylib is re-signed ad-hoc because ``install_name_tool`` invalidates its signature.
+
+    Args:
+        python_dir: The ``python/`` directory containing the extracted tree.
+    """
+    lib = python_dir / "python" / "lib"
+    if not lib.is_dir():
+        return
+    for dylib in lib.glob("libpython3.*.dylib"):
+        if dylib.is_symlink():
+            continue
+        subprocess.run(
+            ["install_name_tool", "-id", f"@rpath/{dylib.name}", str(dylib)],
+            check=True,
+        )
+        if shutil.which("codesign"):
+            subprocess.run(["codesign", "--force", "--sign", "-", str(dylib)], check=False)
 
 
 def install_site_packages(
@@ -139,6 +246,23 @@ def install_site_packages(
         ],
         check=True,
     )
+    trim_site_packages(site_packages)
+
+
+def trim_site_packages(site_packages: Path) -> None:
+    """Strip install byproducts the bundled backend never reads (idempotent).
+
+    Removes ``__pycache__`` trees (the runtime sets ``PYTHONDONTWRITEBYTECODE``) and the
+    console-script shims pip drops into ``bin``/``Scripts`` under ``--target`` — their
+    shebangs point at the build machine's interpreter and are never executed.
+
+    Args:
+        site_packages: The bundle's ``site-packages`` directory.
+    """
+    for cache in site_packages.rglob("__pycache__"):
+        shutil.rmtree(cache, ignore_errors=True)
+    for scripts in ("bin", "Scripts"):
+        shutil.rmtree(site_packages / scripts, ignore_errors=True)
 
 
 def _deps_stamp(requirements: list[str], requirements_file: Path | None) -> str:
@@ -192,7 +316,12 @@ def copy_app_payload(app_root: Path, dest: Path) -> None:
     app_name = get_config().app_name
     pkg = app_root / app_name
     if pkg.is_dir():
-        shutil.copytree(pkg, dest / app_name, dirs_exist_ok=True)
+        shutil.copytree(
+            pkg,
+            dest / app_name,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
 
     shutil.copy2(Path(__file__).parent / "bootstrap.py", dest / "reflex_desktop_bootstrap.py")
 
@@ -218,7 +347,7 @@ def assemble(
         Path to the bundled interpreter (use as ``PYO3_PYTHON`` for ``cargo build``).
     """
     interpreter = fetch_runtime(src_tauri / "python", python_version, release_tag)
-    requirements = ["reflex", "uvicorn[standard]", *(extra_requirements or [])]
+    requirements = [*default_requirements(), *(extra_requirements or [])]
     req_file = app_root / "requirements.txt"
     req_file = req_file if req_file.exists() else None
 
