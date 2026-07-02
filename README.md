@@ -49,10 +49,10 @@ uv pip install reflex
 reflex init                 # pick a blank template
 ```
 
-**2. Add `reflex-desktop`.** It isn't on PyPI yet, so install it from this repo:
+**2. Add `reflex-desktop`:**
 
 ```bash
-uv pip install -e /path/to/reflex-desktop
+uv pip install reflex-desktop
 ```
 
 **3. Write the app.** Replace `hello/hello.py` with a tiny counter — the count lives in
