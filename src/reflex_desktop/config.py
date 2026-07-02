@@ -40,6 +40,12 @@ DEFAULT_TAURI_DIR = "tauri"
 # "tauri.localhost"), which would break the connection. 127.0.0.1 is left untouched.
 LOOPBACK_HOST = "127.0.0.1"
 
+# Dev-mode override consumed by DesktopPlugin while `reflex run` compiles the frontend.
+DEV_BACKEND_URL_ENV = "REFLEX_DESKTOP_DEV_BACKEND_URL"
+
+# Reflex/Vite switch that replaces React Router route HMR with full-page reloads.
+VITE_FORCE_FULL_RELOAD_ENV = "VITE_FORCE_FULL_RELOAD"
+
 
 def slugify(name: str) -> str:
     """Turn a product name into a valid lowercase Cargo crate / binary name.

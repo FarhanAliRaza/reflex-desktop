@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from reflex_desktop import DesktopPlugin
+from reflex_desktop.config import DEV_BACKEND_URL_ENV
 
 
 def test_update_env_json_embedded_pins_loopback():
@@ -23,6 +24,15 @@ def test_update_env_json_custom_port():
     env = DesktopPlugin(backend="embedded", port=9001).update_env_json()
     assert env is not None
     assert env["EVENT"] == "ws://127.0.0.1:9001/_event"
+
+
+def test_update_env_json_dev_backend_url_overrides_embedded(monkeypatch):
+    """Dev mode bakes the live Reflex backend URL, not the embedded production port."""
+    monkeypatch.setenv(DEV_BACKEND_URL_ENV, "http://127.0.0.1:8765/")
+    env = DesktopPlugin(backend="embedded", port=9001).update_env_json()
+    assert env is not None
+    assert env["HEALTH"] == "http://127.0.0.1:8765/_health"
+    assert env["EVENT"] == "ws://127.0.0.1:8765/_event"
 
 
 def test_update_env_json_remote_url_uses_wss():

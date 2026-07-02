@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 from reflex_desktop import cli, desktop
 
@@ -114,3 +115,141 @@ def test_wait_for_port_returns_once_listening():
         server.listen(1)
         port = server.getsockname()[1]
         cli._wait_for_port(port, Alive(), timeout=10)
+
+
+def test_resolve_dev_frontend_port_uses_reflex_default_when_config_unset(monkeypatch):
+    """An unset Reflex frontend_port means use Reflex's default and allow auto-increment."""
+    calls = []
+    monkeypatch.setattr(cli, "_reflex_default_frontend_port", lambda: 3000)
+
+    def handle_port(service_name, port, auto_increment):
+        calls.append((service_name, port, auto_increment))
+        return port
+
+    assert cli._resolve_dev_frontend_port(SimpleNamespace(frontend_port=None), handle_port) == 3000
+    assert calls == [("frontend", 3000, True)]
+
+
+def test_resolve_dev_frontend_port_honors_configured_port():
+    """A configured Reflex frontend_port is used exactly, without auto-increment."""
+    calls = []
+
+    def handle_port(service_name, port, auto_increment):
+        calls.append((service_name, port, auto_increment))
+        return port
+
+    assert cli._resolve_dev_frontend_port(SimpleNamespace(frontend_port=3456), handle_port) == 3456
+    assert calls == [("frontend", 3456, False)]
+
+
+def test_resolve_dev_backend_port_uses_reflex_default_when_config_unset(monkeypatch):
+    """An unset Reflex backend_port means use Reflex's default and allow auto-increment."""
+    calls = []
+    monkeypatch.setattr(cli, "_reflex_default_backend_port", lambda: 8000)
+
+    def handle_port(service_name, port, auto_increment):
+        calls.append((service_name, port, auto_increment))
+        return port
+
+    assert cli._resolve_dev_backend_port(SimpleNamespace(backend_port=None), handle_port) == 8000
+    assert calls == [("backend", 8000, True)]
+
+
+def test_resolve_dev_backend_port_honors_configured_port():
+    """A configured Reflex backend_port is used exactly, without auto-increment."""
+    calls = []
+
+    def handle_port(service_name, port, auto_increment):
+        calls.append((service_name, port, auto_increment))
+        return port
+
+    assert cli._resolve_dev_backend_port(SimpleNamespace(backend_port=8765), handle_port) == 8765
+    assert calls == [("backend", 8765, False)]
+
+
+def test_dev_backend_health_url_honors_backend_path():
+    """The backend readiness check follows Reflex's backend_path prefix."""
+    config = SimpleNamespace(prepend_backend_path=lambda path: f"/api{path}")
+    assert cli._dev_backend_health_url(config, 8765) == "http://127.0.0.1:8765/api/_health"
+
+
+def test_dev_passes_resolved_ports_and_backend_url_to_reflex(monkeypatch, tmp_path):
+    """The dev command starts Reflex on the same concrete ports baked into the webview."""
+    from click.testing import CliRunner
+
+    from reflex_desktop.config import DEV_BACKEND_URL_ENV, VITE_FORCE_FULL_RELOAD_ENV
+    from reflex_desktop.plugin import DesktopPlugin
+
+    cwd = os.getcwd()
+    plugin = DesktopPlugin(product_name="App", identifier="dev.reflex.app")
+    src_tauri = tmp_path / "tauri-dev" / "src-tauri"
+    src_tauri.mkdir(parents=True)
+
+    monkeypatch.setattr(cli, "_preflight", lambda *, bundle: None)
+    monkeypatch.setattr(cli, "_find_plugin", lambda app_root: plugin)
+    monkeypatch.setattr(
+        cli,
+        "_dev_server_config",
+        lambda: (3456, 8765, "http://127.0.0.1:8765", "http://127.0.0.1:8765/_health"),
+    )
+    monkeypatch.setattr(cli, "_reflex_cmd", lambda: ["reflex"])
+    monkeypatch.setattr(DesktopPlugin, "_configure", lambda self, src_tauri: None)
+
+    wait_ports = []
+    monkeypatch.setattr(cli, "_wait_for_port", lambda port, process: wait_ports.append(port))
+    health_urls = []
+    monkeypatch.setattr(
+        cli, "_wait_for_http_ok", lambda url, process: health_urls.append(url)
+    )
+
+    run_commands = []
+    monkeypatch.setattr(
+        cli, "_run", lambda cmd, cwd, env=None: run_commands.append((cmd, cwd, env))
+    )
+
+    popen_commands = []
+
+    class FakeProcess:
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    def popen(cmd, cwd, env=None):
+        popen_commands.append((cmd, cwd, env))
+        return FakeProcess()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+
+    try:
+        result = CliRunner().invoke(cli.main, ["dev", "--app-dir", str(tmp_path)])
+    finally:
+        os.chdir(cwd)
+
+    assert result.exit_code == 0, result.output
+    assert len(popen_commands) == 1
+    popen_cmd, popen_cwd, popen_env = popen_commands[0]
+    assert popen_cmd == [
+        "reflex",
+        "run",
+        "--frontend-port",
+        "3456",
+        "--backend-port",
+        "8765",
+    ]
+    assert popen_cwd == tmp_path.resolve()
+    assert popen_env[DEV_BACKEND_URL_ENV] == "http://127.0.0.1:8765"
+    assert popen_env[VITE_FORCE_FULL_RELOAD_ENV] == "true"
+    assert wait_ports == [3456]
+    assert health_urls == ["http://127.0.0.1:8765/_health"]
+    assert run_commands[0][0][:4] == ["cargo", "tauri", "dev", "--config"]
+    assert "http://localhost:3456" in run_commands[0][0][4]

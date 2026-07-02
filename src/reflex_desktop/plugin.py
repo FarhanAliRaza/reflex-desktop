@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
 import shutil
 import sys
@@ -12,7 +13,7 @@ from typing import Literal
 
 from reflex.plugins import Plugin
 
-from .config import DEFAULT_TAURI_DIR, LOOPBACK_HOST, default_port, slugify
+from .config import DEFAULT_TAURI_DIR, DEV_BACKEND_URL_ENV, LOOPBACK_HOST, default_port, slugify
 
 BackendMode = Literal["remote", "embedded"]
 
@@ -267,6 +268,8 @@ class DesktopPlugin(Plugin):
         Returns:
             The base URL (no trailing slash), or ``None`` to leave ``config.api_url`` as-is.
         """
+        if dev_backend_url := os.environ.get(DEV_BACKEND_URL_ENV):
+            return dev_backend_url.rstrip("/")
         if self.backend == "embedded":
             return f"http://{LOOPBACK_HOST}:{self._resolved_port()}"
         return self.backend_url.rstrip("/") if self.backend_url else None

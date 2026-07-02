@@ -17,7 +17,13 @@ from pathlib import Path
 import click
 
 from . import preflight
-from .config import DEFAULT_TAURI_DIR, slugify
+from .config import (
+    DEFAULT_TAURI_DIR,
+    DEV_BACKEND_URL_ENV,
+    LOOPBACK_HOST,
+    VITE_FORCE_FULL_RELOAD_ENV,
+    slugify,
+)
 
 
 def _find_plugin(app_root: Path):
@@ -436,6 +442,101 @@ def _wait_for_port(port: int, process: subprocess.Popen, timeout: float = 600.0)
     raise click.ClickException(f"timed out waiting for the reflex dev server on port {port}.")
 
 
+def _wait_for_http_ok(url: str, process: subprocess.Popen, timeout: float = 600.0) -> None:
+    """Block until an HTTP URL responds with 200 while the dev server process is alive."""
+    import time
+    import urllib.error
+    import urllib.request
+
+    deadline = time.monotonic() + timeout
+    last_error = ""
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise click.ClickException(
+                f"`reflex run` exited with code {process.returncode} before {url} responded."
+            )
+        try:
+            with urllib.request.urlopen(url, timeout=1.0) as response:
+                if response.status == 200:
+                    return
+                last_error = f"HTTP {response.status}"
+        except (OSError, urllib.error.URLError) as exc:
+            last_error = str(exc)
+            time.sleep(0.5)
+    detail = f" Last error: {last_error}" if last_error else ""
+    raise click.ClickException(f"timed out waiting for the reflex dev backend at {url}.{detail}")
+
+
+def _reflex_default_frontend_port() -> int:
+    """Return Reflex's default dev frontend port, with a fallback for older versions."""
+    try:
+        from reflex_base import constants
+
+        return int(constants.DefaultPorts.FRONTEND_PORT)
+    except (AttributeError, ImportError, TypeError, ValueError):
+        return 3000
+
+
+def _reflex_default_backend_port() -> int:
+    """Return Reflex's default dev backend port, with a fallback for older versions."""
+    try:
+        from reflex_base import constants
+
+        return int(constants.DefaultPorts.BACKEND_PORT)
+    except (AttributeError, ImportError, TypeError, ValueError):
+        return 8000
+
+
+def _resolve_dev_frontend_port(config, handle_port) -> int:
+    """Resolve the frontend port used by ``reflex-desktop dev``.
+
+    Reflex leaves ``frontend_port`` as ``None`` when the app wants the framework default.
+    Because Tauri needs an exact ``devUrl`` up front, choose that effective port before
+    spawning ``reflex run`` and pass it through explicitly.
+    """
+    configured_port = getattr(config, "frontend_port", None)
+    auto_increment = configured_port is None
+    requested_port = _reflex_default_frontend_port() if configured_port is None else configured_port
+    return int(handle_port("frontend", int(requested_port), auto_increment=auto_increment))
+
+
+def _resolve_dev_backend_port(config, handle_port) -> int:
+    """Resolve the backend port used by ``reflex-desktop dev``."""
+    configured_port = getattr(config, "backend_port", None)
+    auto_increment = configured_port is None
+    requested_port = _reflex_default_backend_port() if configured_port is None else configured_port
+    return int(handle_port("backend", int(requested_port), auto_increment=auto_increment))
+
+
+def _dev_backend_url(backend_port: int) -> str:
+    """Return the loopback backend base URL for the Reflex dev server."""
+    return f"http://{LOOPBACK_HOST}:{backend_port}"
+
+
+def _dev_backend_health_url(config, backend_port: int) -> str:
+    """Return the backend health URL, honoring Reflex's backend_path when configured."""
+    prepend = getattr(config, "prepend_backend_path", None)
+    path = prepend("/_health") if callable(prepend) else "/_health"
+    return _dev_backend_url(backend_port) + path
+
+
+def _dev_server_config() -> tuple[int, int, str, str]:
+    """Pick concrete frontend/backend ports and backend URLs for the Reflex dev server."""
+    from reflex.utils import processes
+    from reflex_base.config import get_config
+
+    try:
+        config = get_config()
+        frontend_port = _resolve_dev_frontend_port(config, processes.handle_port)
+        backend_port = _resolve_dev_backend_port(config, processes.handle_port)
+        backend_url = _dev_backend_url(backend_port)
+        return frontend_port, backend_port, backend_url, _dev_backend_health_url(
+            config, backend_port
+        )
+    except SystemExit as exc:
+        raise click.ClickException("could not select dev ports for `reflex run`.") from exc
+
+
 @main.command()
 @click.option("--app-dir", default=".", help="App root containing rxconfig.py.")
 def dev(app_dir: str) -> None:
@@ -480,16 +581,33 @@ def dev(app_dir: str) -> None:
     # devUrl replaces the static dist in dev, but keep the configured path present.
     (src_tauri.parent / "dist").mkdir(parents=True, exist_ok=True)
 
-    from reflex_base.config import get_config
-
-    frontend_port = int(get_config().frontend_port)
+    frontend_port, backend_port, backend_url, backend_health_url = _dev_server_config()
     dev_url = f"http://localhost:{frontend_port}"
 
     click.echo(f"reflex-desktop: starting `reflex run` (dev server on {dev_url})...")
-    reflex_proc = subprocess.Popen([*_reflex_cmd(), "run"], cwd=app_root)
+    reflex_env = {
+        **os.environ,
+        DEV_BACKEND_URL_ENV: backend_url,
+        VITE_FORCE_FULL_RELOAD_ENV: "true",
+    }
+    reflex_proc = subprocess.Popen(
+        [
+            *_reflex_cmd(),
+            "run",
+            "--frontend-port",
+            str(frontend_port),
+            "--backend-port",
+            str(backend_port),
+        ],
+        cwd=app_root,
+        env=reflex_env,
+    )
     try:
         _wait_for_port(frontend_port, reflex_proc)
-        click.echo("reflex-desktop: dev server is up; launching the Tauri dev shell.")
+        _wait_for_http_ok(backend_health_url, reflex_proc)
+        click.echo(
+            "reflex-desktop: dev frontend and backend are up; launching the Tauri dev shell."
+        )
         config_override = json.dumps({"build": {"devUrl": dev_url}})
         _run(
             ["cargo", "tauri", "dev", "--config", config_override],
