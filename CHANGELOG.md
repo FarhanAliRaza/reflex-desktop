@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.1.0
 
 The "shippable installers" release: embedded bundles now run on machines other than the
 one that built them, plus a real dev loop and the most-requested desktop primitives.
