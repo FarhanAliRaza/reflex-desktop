@@ -45,6 +45,17 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/reflex_desktop"]
 
+[tool.hatch.build.targets.sdist]
+# Keep the sdist minimal and reproducible: only the package and CHANGELOG.
+# (README, LICENSE, and pyproject.toml are always force-included as metadata.)
+# only-include is an authoritative allowlist — without it hatchling walks the whole
+# repo and drags in the example/ app's local .web/node_modules and Tauri build tree
+# (which can even contain dangling symlinks from a prior desktop build).
+only-include = [
+    "src/reflex_desktop",
+    "CHANGELOG.md",
+]
+
 [tool.ruff]
 target-version = "py310"
 line-length = 100
