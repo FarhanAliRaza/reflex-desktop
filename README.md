@@ -133,10 +133,13 @@ reflex-desktop build --bundle     # also produce installers (.dmg/.msi/.AppImage
 reflex-desktop doctor             # check your machine has what it needs to build
 ```
 
-`dev` starts the normal `reflex run` dev server, then opens a Tauri shell pointed at it —
-edit your Python and the window hot-reloads, while native bridge features
-(`window.__TAURI__`) keep working. The dev shell lives in `<app>/tauri-dev/` and only
-compiles Rust the first time (it needs the Tauri CLI, like `--bundle`).
+`dev` starts the normal `reflex run` dev server, waits until both the frontend and the
+backend health check are actually answering, then opens a Tauri shell pointed at the live
+dev backend — edit your Python and the window hot-reloads, while native bridge features
+(`window.__TAURI__`) keep working. Ports come from your `rxconfig.py` (or Reflex's
+defaults), and if one is already taken it bumps to the next free one, same as `reflex run`.
+The dev shell lives in `<app>/tauri-dev/` and only compiles Rust the first time (it needs
+the Tauri CLI, like `--bundle`).
 
 `run` does a fast **debug** build by default (like `cargo run`); add `--release` for an
 optimized one. `build` defaults to **release**. The generated Tauri project lives under
@@ -242,6 +245,9 @@ the wire (`file_path` → `filePath`), which is the classic silent failure when 
 commands by hand; pass `convert_keys=False` if your command is declared with
 `#[tauri::command(rename_all = "snake_case")]`.
 
+The package ships type stubs for all of this, so your editor and type checker know what
+`desktop.minimize()` and friends are without you doing anything.
+
 **Auto-updates & signing.** `tauri_plugins=("updater",)` plus
 `updater_endpoints=(...)`/`updater_pubkey=...` wires Tauri's updater into the shell and
 turns on signed update artifacts at bundle time — see [docs/updater.md](docs/updater.md).
@@ -263,11 +269,15 @@ Tauri project, so add crates, edit `main.rs`, whatever you need.
 - **`reflex-desktop run`/`build` package a production build** — the window loads a
   prebuilt static frontend, so editing code doesn't live-update it. That's what
   `reflex-desktop dev` is for: the hot-reloading dev server inside the real webview.
-- **`dev` uses the dev server as the backend**, so the embedded in-process interpreter
-  isn't exercised until you do a real `run`/`build`. Smoke-test the built app before
-  shipping.
+- **`dev` talks to the dev server, not the embedded interpreter** — the webview points at
+  the live dev backend, so the in-process interpreter isn't exercised until you do a real
+  `run`/`build`. Smoke-test the built app before shipping.
 - **The dev shell compiles Rust once** (first `dev` invocation) and whenever you change
   native config (tray, plugins). Pure Python edits never recompile.
+- **No `tkinter` in embedded builds.** The bundled runtime drops Tcl/Tk entirely to keep
+  installers small (and to keep the Linux bundler happy), so an embedded backend that
+  imports `tkinter` will crash. You're building your UI in Reflex anyway, but if some
+  dependency reaches for it, that's why.
 
 ### What's solid vs. still in progress
 
@@ -275,11 +285,21 @@ Tauri project, so add crates, edit `main.rs`, whatever you need.
 - **`embedded`** — self-contained builds and installers: the binary boots a bundled
   interpreter in-process and serves your Reflex backend locally. Installed bundles find
   the bundled interpreter through relative library paths (`$ORIGIN` on Linux,
-  `@rpath`/`@executable_path` on macOS, exe-adjacent DLLs on Windows), the backend
-  dependencies are pinned to the exact reflex version you built with, and unused runtime
-  pieces (stdlib test suite, Tcl/Tk, bytecode caches) are trimmed from the bundle. CI
-  installs the built `.deb` and boots the embedded backend from the installed location on
-  every push.
+  `@rpath`/`@executable_path` on macOS, exe-adjacent DLLs on Windows), and the backend
+  dependencies are pinned to the exact reflex version you built with. CI installs the
+  built `.deb` and boots the embedded backend from the installed location on every push.
+- **Installers are a reasonable size.** The bundled runtime gets slimmed hard before
+  packaging — debug symbols stripped from libpython, the interpreter deduplicated down to
+  a single copy, Tcl/Tk and the stdlib test suite dropped, compiled wheel extensions
+  stripped. That took the example app's `.deb` from 262 MB to 85 MB. The stripping only
+  happens on Linux (it would break code signing on macOS, and Windows has no `strip`), so
+  expect bigger numbers there.
+- **Upgrades actually deliver your new code.** An installed app keeps a per-user writable
+  copy of the app payload; each build stamps it with a content hash, and when the
+  installed version changes, the copy refreshes on next launch — without wiping runtime
+  state like uploaded files.
+- **Linux installers** (`.deb`, `.AppImage`) build and install cleanly, including on
+  machines that no longer ship `libfuse2`.
 - **macOS/Windows** builds compile in CI; broader real-hardware validation (and signing —
   see [docs/signing.md](docs/signing.md)) is on you for now.
 
