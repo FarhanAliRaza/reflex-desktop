@@ -126,6 +126,34 @@ def test_assemble_reinstalls_when_requirements_change(monkeypatch, tmp_path):
     assert len(installs) == 2
 
 
+def test_copy_app_payload_writes_content_stamp(monkeypatch, tmp_path):
+    """copy_app_payload stamps the payload so the shell can detect a changed build."""
+    from types import SimpleNamespace
+
+    import reflex_base.config as rxconfig
+
+    monkeypatch.setattr(rxconfig, "get_config", lambda: SimpleNamespace(app_name="myapp"))
+
+    app_root = tmp_path / "app_root"
+    (app_root / "myapp").mkdir(parents=True)
+    (app_root / "rxconfig.py").write_text("config = 1\n")
+    (app_root / "myapp" / "myapp.py").write_text("x = 1\n")
+
+    dest = tmp_path / "payload"
+    runtime.copy_app_payload(app_root, dest)
+
+    stamp = dest / runtime.PAYLOAD_STAMP
+    assert stamp.exists()
+    first = stamp.read_text()
+
+    # Re-stamping identical content is stable; changing a payload file changes the stamp.
+    runtime._write_payload_stamp(dest)
+    assert stamp.read_text() == first
+    (dest / "myapp" / "myapp.py").write_text("x = 2\n")
+    runtime._write_payload_stamp(dest)
+    assert stamp.read_text() != first
+
+
 def _patch_config(monkeypatch, origins):
     """Make get_config() return a stub config with the given CORS origins."""
     from types import SimpleNamespace
@@ -202,11 +230,21 @@ def test_assemble_installs_pinned_requirements(monkeypatch, tmp_path):
 def test_trim_runtime_prunes_unused_stdlib(tmp_path):
     """trim_runtime drops the stdlib test/tkinter/idle trees and Tcl/Tk, keeps the rest."""
     python_dir = tmp_path / "python"
-    stdlib = python_dir / "python" / "lib" / "python3.12"
+    lib = python_dir / "python" / "lib"
+    stdlib = lib / "python3.12"
     for name in ("test", "idlelib", "tkinter", "turtledemo", "asyncio", "encodings"):
         (stdlib / name).mkdir(parents=True)
     (python_dir / "python" / "lib" / "tcl8.6").mkdir(parents=True)
     (python_dir / "python" / "lib" / "tk8.6").mkdir(parents=True)
+    # The _tkinter extension and its libtcl/libtk shared libs must go too, or bundlers
+    # that scan every ELF (linuxdeploy) abort when libtcl resolves only inside the runtime.
+    dynload = stdlib / "lib-dynload"
+    dynload.mkdir()
+    (dynload / "_tkinter.cpython-312-x86_64-linux-gnu.so").write_bytes(b"")
+    (dynload / "_socket.cpython-312-x86_64-linux-gnu.so").write_bytes(b"")
+    (lib / "libtcl9.0.so").write_bytes(b"")
+    (lib / "libtcl9tk9.0.so").write_bytes(b"")
+    (lib / "libpython3.12.so").write_bytes(b"")
 
     runtime.trim_runtime(python_dir)
 
@@ -216,6 +254,11 @@ def test_trim_runtime_prunes_unused_stdlib(tmp_path):
     assert (stdlib / "encodings").exists()
     assert not (python_dir / "python" / "lib" / "tcl8.6").exists()
     assert not (python_dir / "python" / "lib" / "tk8.6").exists()
+    assert not (dynload / "_tkinter.cpython-312-x86_64-linux-gnu.so").exists()
+    assert (dynload / "_socket.cpython-312-x86_64-linux-gnu.so").exists()
+    assert not (lib / "libtcl9.0.so").exists()
+    assert not (lib / "libtcl9tk9.0.so").exists()
+    assert (lib / "libpython3.12.so").exists()
 
 
 def test_trim_runtime_windows_layout(tmp_path):

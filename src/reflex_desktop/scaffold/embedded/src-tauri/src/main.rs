@@ -119,15 +119,35 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+// Content stamp written into the payload at build time (see runtime.py PAYLOAD_STAMP).
+const PAYLOAD_STAMP: &str = ".reflex_desktop_build";
+
 // Bundle resources are read-only / signed on macOS and Windows, but the backend writes
 // under its working dir (.web/backend, uploads). Copy the app payload to a per-user
 // writable dir on first launch and run from there.
+//
+// Refresh that copy whenever the bundled payload's content stamp differs, so an upgraded
+// or rebuilt app's code reaches the user instead of a stale first-run copy sticking around
+// forever. The copy overlays the payload without wiping the dir, preserving the backend's
+// runtime state (.web, .states, reflex.lock, uploads); files deleted between builds linger
+// harmlessly rather than risk removing user data.
 fn ensure_writable_app_root(
     bundled_app: &Path,
     app_data: &Path,
 ) -> std::io::Result<std::path::PathBuf> {
     let dest = app_data.join("app");
-    if !dest.join("rxconfig.py").exists() {
+    let bundled_stamp = std::fs::read_to_string(bundled_app.join(PAYLOAD_STAMP)).ok();
+    let dest_stamp = std::fs::read_to_string(dest.join(PAYLOAD_STAMP)).ok();
+    let needs_refresh = if !dest.join("rxconfig.py").exists() {
+        true
+    } else if let Some(bundled) = &bundled_stamp {
+        // A shipped stamp is authoritative: re-copy unless the extracted copy matches it.
+        dest_stamp.as_deref() != Some(bundled.as_str())
+    } else {
+        // No stamp in the bundle (shouldn't happen with current builds): keep the existing copy.
+        false
+    };
+    if needs_refresh {
         copy_dir_all(bundled_app, &dest)?;
     }
     Ok(dest)

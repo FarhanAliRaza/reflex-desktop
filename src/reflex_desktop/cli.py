@@ -274,6 +274,19 @@ def _binary_path(src_tauri: Path, release: bool) -> Path | None:
     return target_dir / ("release" if release else "debug") / name
 
 
+def _clean_bundle_staging(src_tauri: Path, release: bool) -> None:
+    """Remove Tauri's bundle output/staging trees before bundling.
+
+    The bundler copies resources over any existing staging dirs (the AppDir,
+    ``appimage_deb/data``, deb/rpm data trees) without deleting files that no longer
+    exist in the source, so files removed from the app or the embedded runtime would
+    otherwise linger inside freshly built installers.
+    """
+    target = os.environ.get("CARGO_TARGET_DIR")
+    target_dir = Path(target) if target else src_tauri / "target"
+    shutil.rmtree(target_dir / ("release" if release else "debug") / "bundle", ignore_errors=True)
+
+
 def _build_app(app_dir: str, release: bool, bundle: bool, skip_export: bool):
     """Export the frontend and compile the Tauri binary.
 
@@ -317,7 +330,13 @@ def _build_app(app_dir: str, release: bool, bundle: bool, skip_export: bool):
         env = {**os.environ, "PYO3_PYTHON": str(interpreter)}
 
     if bundle:
+        _clean_bundle_staging(src_tauri, release)
         cmd = ["cargo", "tauri", "build"] + ([] if release else ["--debug"])
+        if sys.platform == "linux":
+            # linuxdeploy and friends are AppImages themselves; self-extracting them
+            # avoids requiring libfuse2, which modern distros no longer ship.
+            env = {**(env or os.environ)}
+            env.setdefault("APPIMAGE_EXTRACT_AND_RUN", "1")
     else:
         cmd = ["cargo", "build"] + (["--release"] if release else [])
     _run(cmd, cwd=src_tauri, env=env)

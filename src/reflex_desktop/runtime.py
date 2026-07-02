@@ -13,6 +13,7 @@ points ``PYTHONHOME``/``PYTHONPATH`` at ``python/`` and ``site-packages/`` at ru
 
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
 import platform
 import shutil
@@ -123,6 +124,8 @@ def fetch_runtime(python_dir: Path, python_version: str, release_tag: str) -> Pa
     """
     interpreter = _interpreter_path(python_dir)
     if interpreter.exists():
+        # Re-trim so runtimes extracted by older versions pick up new prune rules.
+        trim_runtime(python_dir)
         return interpreter
 
     url = standalone_url(python_version, release_tag, host_triple())
@@ -179,6 +182,11 @@ def trim_runtime(python_dir: Path) -> None:
     if stdlib is not None:
         for name in _STDLIB_PRUNE:
             shutil.rmtree(stdlib / name, ignore_errors=True)
+        # The _tkinter extension must go with the tkinter package: bundle scanners
+        # (linuxdeploy for AppImages) walk every bundled ELF and abort when its
+        # libtcl/libtk dependencies resolve only inside this runtime tree.
+        for entry in (stdlib / "lib-dynload").glob("_tkinter.*"):
+            entry.unlink()
 
     root = python_dir / "python"
     # Tcl/Tk data trees: lib/tcl8.6, lib/tk8.6, lib/itcl* on unix; tcl/ on Windows.
@@ -187,6 +195,12 @@ def trim_runtime(python_dir: Path) -> None:
         for entry in lib.iterdir():
             if entry.is_dir() and entry.name.startswith(("tcl", "tk", "itcl", "thread")):
                 shutil.rmtree(entry, ignore_errors=True)
+            elif entry.is_file() and entry.name.startswith(("libtcl", "libtk")):
+                entry.unlink()
+    # Windows keeps _tkinter and the Tcl/Tk DLLs under DLLs/ instead of lib/.
+    for pattern in ("_tkinter.*", "tcl*.dll", "tk*.dll"):
+        for entry in (root / "DLLs").glob(pattern):
+            entry.unlink()
     shutil.rmtree(root / "tcl", ignore_errors=True)
     shutil.rmtree(root / "share", ignore_errors=True)
 
@@ -324,6 +338,29 @@ def copy_app_payload(app_root: Path, dest: Path) -> None:
         )
 
     shutil.copy2(Path(__file__).parent / "bootstrap.py", dest / "reflex_desktop_bootstrap.py")
+
+    _write_payload_stamp(dest)
+
+
+# Name of the payload content stamp. The embedded shell copies the payload to a per-user
+# writable dir on first launch; it re-copies whenever this stamp differs, so an upgraded
+# (or rebuilt) app's code actually reaches users instead of a stale first-run copy lingering.
+PAYLOAD_STAMP = ".reflex_desktop_build"
+
+
+def _write_payload_stamp(dest: Path) -> None:
+    """Write a content hash of the payload so the shell can detect a changed build.
+
+    Args:
+        dest: The bundle's ``app/`` payload directory.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(p for p in dest.rglob("*") if p.is_file() and p.name != PAYLOAD_STAMP):
+        digest.update(str(path.relative_to(dest)).encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    (dest / PAYLOAD_STAMP).write_text(digest.hexdigest())
 
 
 def assemble(
