@@ -261,6 +261,50 @@ def test_trim_runtime_prunes_unused_stdlib(tmp_path):
     assert (lib / "libpython3.12.so").exists()
 
 
+def test_prune_interpreter_copies_keeps_single_real_binary(tmp_path):
+    """The python/python3 aliases are removed, leaving one real binary at bin/python3.
+
+    Tauri dereferences symlinks when bundling, so the tarball's aliases would each become a
+    full ~100 MB interpreter copy; only bin/python3 should survive, as a real file.
+    """
+    if sys.platform == "win32":
+        pytest.skip("interpreter pruning targets the POSIX bin/ layout")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "python3.12").write_bytes(b"\x7fELFinterpreter")
+    (bindir / "python3").symlink_to("python3.12")
+    (bindir / "python").symlink_to("python3.12")
+
+    runtime._prune_interpreter_copies(bindir)
+
+    py3 = bindir / "python3"
+    assert py3.exists() and not py3.is_symlink()
+    assert py3.read_bytes() == b"\x7fELFinterpreter"
+    assert not (bindir / "python").exists()
+    assert not (bindir / "python3.12").exists()
+    # Idempotent: a second pass over the consolidated layout is a no-op.
+    runtime._prune_interpreter_copies(bindir)
+    assert py3.exists() and not py3.is_symlink()
+
+
+def test_strip_binaries_skips_non_elf_and_symlinks(tmp_path):
+    """_strip_binaries only touches real ELF files (never scripts or symlinks)."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("stripping is gated to Linux")
+    script = tmp_path / "python3.12-config"
+    script.write_text("#!/bin/sh\necho hi\n")
+    before = script.read_text()
+    link = tmp_path / "libpython3.12.so"
+    (tmp_path / "libpython3.12.so.1.0").write_bytes(b"not-an-elf")
+    link.symlink_to("libpython3.12.so.1.0")
+
+    # Must not raise, corrupt the script, or resolve the symlink into a real file.
+    runtime._strip_binaries(tmp_path.glob("*"))
+
+    assert script.read_text() == before
+    assert link.is_symlink()
+
+
 def test_trim_runtime_windows_layout(tmp_path):
     """trim_runtime handles the Windows tree (Lib/ stdlib, top-level tcl/)."""
     python_dir = tmp_path / "python"

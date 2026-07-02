@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tarfile
 import urllib.request
+from collections.abc import Iterable
 from pathlib import Path
 
 # A pinned python-build-standalone release. Override via assemble(release_tag=...).
@@ -168,12 +169,77 @@ def _stdlib_dir(python_dir: Path) -> Path | None:
     return None
 
 
+def _is_elf(path: Path) -> bool:
+    """Return whether ``path`` is a regular ELF binary (not a symlink or script)."""
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        with path.open("rb") as fh:
+            return fh.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def _strip_binaries(paths: Iterable[Path]) -> None:
+    """Strip debug symbols from ELF binaries in place (Linux only, best-effort).
+
+    python-build-standalone ships ``libpython`` and the interpreter unstripped, and their
+    DWARF debug sections dominate the bundle (``libpython`` alone is ~200 MB unstripped).
+    Only ``--strip-debug`` is used: a full ``strip`` corrupts these static, symbol-versioned
+    binaries (``.dynstr not in segment`` -> ``undefined symbol: , version`` at load), whereas
+    dropping just the ``.debug_*`` sections keeps every symbol/version table the loader and
+    PyO3 resolve against. Gated to Linux: macOS stripping invalidates code signatures and
+    Windows has no ``strip``.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    strip = shutil.which("strip")
+    if not strip:
+        return
+    for path in paths:
+        if _is_elf(path):
+            subprocess.run([strip, "--strip-debug", str(path)], check=False)
+
+
+def _prune_interpreter_copies(bindir: Path) -> None:
+    """Leave one real interpreter at ``bin/python3``; drop the alias links (not Windows).
+
+    The tarball ships ``python`` and ``python3`` as symlinks to ``python3.x``, but Tauri
+    dereferences symlinks when bundling, turning each into a full ~100 MB copy. The build
+    uses only ``bin/python3`` and the PyO3 runtime drives ``libpython`` directly, so the
+    other names are redundant: consolidate the real binary at ``bin/python3`` and remove the
+    aliases, leaving one interpreter in the bundle instead of three.
+
+    Args:
+        bindir: The runtime's ``bin`` directory.
+    """
+    if sys.platform == "win32":
+        return
+    py3 = bindir / "python3"
+    if not py3.exists():
+        return
+    real = py3.resolve()
+    aliases = [
+        p
+        for p in bindir.glob("python*")
+        if p.is_symlink() and not p.name.endswith("-config") and p.resolve() == real
+    ]
+    # Move the real binary onto the canonical name so build/runtime lookups keep working.
+    if py3.is_symlink():
+        py3.unlink()
+        shutil.move(str(real), str(py3))
+    for alias in aliases:
+        if alias != py3 and (alias.is_symlink() or alias.exists()):
+            alias.unlink()
+
+
 def trim_runtime(python_dir: Path) -> None:
     """Prune runtime pieces a headless embedded backend never uses (idempotent).
 
     Drops the stdlib test suite, IDLE, and tkinter/turtledemo plus the Tcl/Tk support
     trees — together well over 100 MB uncompressed — while keeping pip (still needed to
-    assemble ``site-packages``).
+    assemble ``site-packages``). Also collapses the interpreter/``libpython`` duplicate
+    copies into symlinks and strips their debug symbols, which reclaims several hundred MB.
 
     Args:
         python_dir: The ``python/`` directory containing the extracted tree.
@@ -203,6 +269,14 @@ def trim_runtime(python_dir: Path) -> None:
             entry.unlink()
     shutil.rmtree(root / "tcl", ignore_errors=True)
     shutil.rmtree(root / "share", ignore_errors=True)
+
+    # Strip libpython's debug symbols (~200 MB -> ~30 MB). Not the interpreter: strip corrupts
+    # that static, symbol-versioned binary, and it is only used at build time anyway.
+    if lib.is_dir():
+        _strip_binaries(lib.glob("libpython3.*.so*"))
+    bindir = root / "bin"
+    if bindir.is_dir():
+        _prune_interpreter_copies(bindir)
 
 
 def _rewrite_macos_libpython_id(python_dir: Path) -> None:
@@ -277,6 +351,9 @@ def trim_site_packages(site_packages: Path) -> None:
         shutil.rmtree(cache, ignore_errors=True)
     for scripts in ("bin", "Scripts"):
         shutil.rmtree(site_packages / scripts, ignore_errors=True)
+    # Compiled wheels (granian, uvloop, pydantic-core) can ship unstripped; strip is a
+    # no-op on those the maintainers already stripped, so this is safe and best-effort.
+    _strip_binaries(site_packages.rglob("*.so"))
 
 
 def _deps_stamp(requirements: list[str], requirements_file: Path | None) -> str:
