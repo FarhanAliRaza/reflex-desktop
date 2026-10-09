@@ -1,0 +1,22 @@
+[package]
+name = "reflex-desktop-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless driver for the Reflex desktop core: sandbox, agent and deploy without a window"
+
+[[bin]]
+name = "rxd"
+path = "src/main.rs"
+
+[dependencies]
+reflex-desktop-core.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+shell-words = "1"
